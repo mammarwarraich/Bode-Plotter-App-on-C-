@@ -1,0 +1,3436 @@
+/******************************************************************************
+ * PROJECT:      BodePlotter
+ * AUTHORS:       Ammar Asad Warraich, Taimoor Abdullah, Muhammad Huzaifa
+ * INSTITUTION:  School of Electrical Engineering and Computer Science (SEECS)
+ * National University of Sciences and Technology (NUST)
+ * * DESCRIPTION:
+ * This application is a  Frequency Response Analyzer designed for Manual input
+ * And 2nd-order RLC networks and 1st-order RC circuits. It performs computation
+ * of Transfer .Functions to generate Magnitude (dB) and Phase (Degrees) Bode Plots.
+ *
+ * KEY FEATURES:
+ * - Real-time Signal Processing: Dynamic recalculation of network behavior.
+ * - Logarithmic Scaling: Accurate mapping of frequency responses.
+ * - Stability & Robustness: Implements safe-parsing algorithms.
+ * - Key Concepts used: Complex Numbers,Laplace,Roots,Loops,Switch
+ *   ,Conditional logic, Pointers, UI design, Logarithmic Scaling
+ * TECHNICAL SPECIFICATIONS:
+ * - Framework: SFML 3.0 (Static Linking)
+ * - Language: C++
+ * - Mathematical Model: Complex Impedance Analysis / Laplace .
+ * * DATE: April 2026
+ ******************************************************************************/
+
+#include <SFML/Graphics.hpp> // Core UI framework: Handles windows, rendering, and user input.
+#include <complex>           // AC Analysis: Provides the complex number class for Phasor and Transfer Function calculation.
+#include <vector>            // Dynamic Arrays: Stores the vertex points for the Magnitude and Phase plots.
+#include <string>            // Text Handling: Manages UI labels and inputted component values.
+#include <sstream>           // String Formatting: Facilitates conversion between numeric data and UI display text.
+#include <cmath>             // Mathematical Functions: Used for log10, pow, and trigonometric calculations.
+#include <fstream>           // Data Persistence: Enables exporting plot data.
+#include <algorithm>         // Data Manipulation: Provides clamp,min/max for signal bounding and safety.
+#include <iomanip>           // Stream Formatting: Controls the decimal precision of displayed engineering values.
+#include <limits>            // Numeric Safety: Defines boundaries for floating-point calculations.
+#include <numeric>           // Accumulation: Useful for signal averaging.
+#include <array>             // Fixed-Size Containers: Optimized storage.
+#include <ctime>             // Time Management: Used for timestamps in exported files and animations.
+#include <cstdlib>           // General Utilities: functions for memory management.
+
+#ifndef M_PI                            //This is a conditional check it asks compiler if this already exists ion memory otherwise it moves to next line.
+#define M_PI 3.14159265358979323846     //we set vallue of pi.
+#endif
+
+//────────────────────────────────────────────────────────────────────────────────────────
+// This block of code is essentially the "Security Guard" of our application. 
+// In a GUI the user is constantly typing and deleting characters. If math engine
+// tries to calculate the Bode plot using a halftyped number , a standard C++ 
+// program would crash instantly.So we define this block of code to prevent this 
+// here is how it works >>>
+// Whitespace Cleanup: It ignores leading spaces. If the input is just empty spaces, 
+// it gives back a number instead of crashing.
+// The Filter: It recognizes that if a user has only typed . or -. It returns the 
+// fallback so the math doesn't break while they finish typing .
+// Strict Conversion: It uses 'stod' but adds a "Garbage Check." If a user types 100uF,
+// stod would normally just read the 100 and ignore the uF. This code notices that
+// "uF" wasn't read and decides the input is invalid, preventing unexpected behavior.
+// Bounds Protection: It uses std::clamp to make sure the values stay within a physical range.
+// Change Detection: The second function checks if the new input is different from the old one.
+// and only redraws the graph if the number actually changed.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+static double safeParseDouble(const std::string& s,
+                               double fallback = 0.0, //the safety number
+                               double minVal   = -1e300, //lower bound
+                               double maxVal   =  1e300) //upper bound
+{
+    // 1:  empty or pure whitespace
+    if (s.empty()) return fallback;                     //returns safety number
+    auto first = s.find_first_not_of(" \t\r\n");        //looks for first number which is not tab or space or newline
+    if (first == std::string::npos) return fallback;    //if nothing was found return safety number
+
+    // 2:  only a sign character or lone decimal point — user is mid-typing
+    std::string trimmed = s.substr(first);                      // Create a substring starting from the first non-whitespace character
+    if (trimmed == "+" || trimmed == "-" || trimmed == "." ||   // Check for incomplete numeric symbols (+, -, .).
+        trimmed == "+." || trimmed == "-.") return fallback;    // Check for incomplete numeric symbols (+, -, .).
+                                                                // These are not valid 'double' values yet, but are expected during user input.
+
+    // 3/4:  attempt conversion
+    try {
+        std::size_t pos = 0;                            // Tracks how many characters were successfully converted
+        double val = std::stod(trimmed, &pos);
+
+        // Ensure the entire string was consumed. std::stod ignores trailing 
+        // non-numeric characters (e.g., "12.5abc"), we treat them as invalid.
+        // We skip any trailing spaces/tabs before the final check.
+        while (pos < trimmed.size() &&
+               (trimmed[pos] == ' ' || trimmed[pos] == '\t')) ++pos;
+        if (pos != trimmed.size()) return fallback;     // If 'pos' hasn't reached the end, the string contains illegal characters
+
+        // 5:  non-finite result
+        if (!std::isfinite(val)) return fallback;       // Reject results that are Infinity or NaN (Not a Number) to ensure
+                                                        // the stability of the complex impedance calculations.
+
+        return std::clamp(val, minVal, maxVal);         // Clamp the final value between the defined min and max engineering limits.
+    }
+    catch (...) {                                       // Universal catch-all: if stod throws invalid_argument or out_of_range,
+        return fallback;                                // return fallback to keep the application running.
+    }
+}
+
+/**
+ * @brief Synchronizes UI string input with internal variables.
+ * * This wrapper performs three critical tasks:
+ * 1. Validates the input string using the safeParseDouble logic.
+ * 2. Updates the 'out' reference (e.g., your Resistance or Capacitance variable).
+ * 3. Returns a boolean signal to indicate if a recalculation is necessary.
+ * @param s The raw string from the UI textbox.
+ * @param out A reference to the internal variable to be updated.
+ * @return true if the value was successfully changed (Trigger Re-plot).
+ * @return false if the value remains the same or input was invalid (Skip Re-plot).
+ */
+static bool updateValueSafely(const std::string& s, double& out,
+                              double fallback = 0.0,
+                              double minVal   = -1e300,
+                              double maxVal   =  1e300)
+{
+    double result = safeParseDouble(s, fallback, minVal, maxVal);   // 1. Get a validated, clamped numeric result
+    bool changed  = (result != out);                                // 2. Determine if the new value differs from the current stored state
+    out = result;                                                   // 3. Update the actual variable used in Transfer Function calculations
+    return changed;                                                 // signal main loop to initiate redraw 
+}
+
+enum class CircuitType {
+    LowPass = 0,
+    HighPass = 1,
+    BandPass = 2
+};
+// ─────────────────────────────────────────────────────────────────────────────
+//  APP STATES
+// ─────────────────────────────────────────────────────────────────────────────
+enum class AppState { WELCOME, DASHBOARD };
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  THEME
+// ─────────────────────────────────────────────────────────────────────────────
+struct Theme {
+    sf::Color bg,       // Global background
+              panel,    // Sidebar/Input area
+              accent,   // High-visibility color for primary buttons
+              grid_mj,  // Major grid lines (Decades)
+              grid_mn,  // Minor grid lines (Sub-divisions)
+              text_hi,  // Primary headers/labels
+              text_lo,  // Secondary descriptions
+              in_bg,    // Text box background
+              border,   // Input field boundaries
+              probe,    // Color for the interactive data-hover probe
+              tt_bg,    // Tooltip background
+              good,     // Positive status (e.g., valid input)
+              bad,      // Error status (e.g., out-of-range value)
+              ghost,    // Inactive/placeholder elements
+              line_sep; // UI dividers
+};
+
+static const Theme T_DARK = {   // DARK MODE
+    {18,18,18},{26,26,26},{255,140,0},{55,55,55},{35,35,35},
+    {255,255,255},{130,130,130},{32,32,32},{65,65,65},
+    {255,200,50,200},{14,14,14,230},{60,200,120},{235,80,80},
+    {200,200,200,128},{50,50,50}
+};
+static const Theme T_LIGHT = {   // LIGHT MODE
+    // bg=white, panel=offwhite, accent=RED for plots, grids=light gray
+    {255,255,255},{245,245,248},{210,30,30},{190,195,205},{215,220,228},
+    // text_hi=near-black, text_lo=dark gray, in_bg=light, border=medium gray
+    {15,15,20},{70,75,85},{230,232,238},{150,158,170},
+    // probe, tt_bg, good, bad, ghost, line_sep
+    {200,40,0,200},{245,245,248,230},{20,150,80},{200,40,40},
+    {80,80,80,128},{175,182,195}
+};
+static Theme T = T_DARK;          // THEME BY DEFAULT
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  MATH ENGINE
+// ─────────────────────────────────────────────────────────────────────────────
+
+//─────────────────────────────────────────────────────────────────────────────
+//  @brief Changes comma-separated strings into a coefficient vector.
+//  Handles the extraction of Numerator/Denominator coefficients for 
+//  the Transfer Function H(s).
+//─────────────────────────────────────────────────────────────────────────────
+
+std::vector<double> parseCoeffs(const std::string& s)
+{
+    std::vector<double> out;
+    std::stringstream ss(s);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {                            // Tokenize the string by commas
+        auto a = tok.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos) continue;                       // Skip empty tokens
+        auto b = tok.find_last_not_of(" \t\r\n");
+        try { out.push_back(std::stod(tok.substr(a, b - a + 1))); } // Convert the 'cleaned' substring to a double and store
+        catch (...) {}                                              //ignore wrong input coeffeceints
+    }
+    return out;
+}
+
+/**
+ * @brief Evaluates a polynomial at complex frequency 's' using Horner's Method.
+ * Efficiently computes the Numerator N(s) or Denominator D(s) to find 
+ * the frequency response H(s) = N(s)/D(s).
+ */
+
+std::complex<double> evalPoly(const std::vector<double>& c, std::complex<double> s)
+{
+    std::complex<double> r{0.0, 0.0};
+    for (double v : c) r = r * s + v;
+    return r;
+}
+
+/**
+ * @struct BodeData
+ * @brief A container for the computed frequency domain results.
+ * Synchronizes the frequency axis with its corresponding Magnitude (dB) 
+ * and Phase (Degrees) values for plotting.
+ */
+
+struct BodeData {
+    std::vector<double> freq, mag, phase;
+    bool valid = false;                  // Flag to prevent rendering of invalid/empty data
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  COMPUTE BODE  s = j*(2*pi*f)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * @brief Computes the Frequency Response H(jw) for the given Transfer Function.
+ * Performs a logarithmic sweep and calculates Magnitude (dB) and Phase (Deg).
+ * * @param num Coefficient vector for the Numerator polynomial.
+ * @param den Coefficient vector for the Denominator polynomial.
+ * @param maxFreq The upper frequency bound for the plot (Hz).
+ * @param N Number of discrete frequency samples (default 700 for high resolution).
+ */
+
+BodeData computeBode(const std::vector<double>& num,
+                     const std::vector<double>& den,
+                     double maxFreq = 1e6,
+                     int N = 700)
+{
+    BodeData d;
+    if (num.empty() || den.empty() || den[0] == 0.0) return d;   // Basic validation: Avoid division by zero or empty networks
+    // --- STAGE 1: COEFFICIENT NORMALIZATION ---
+    // ── Normalize both polynomials by den[0] ensures transfer function is in standard form.
+    // e.g. H(s) = (2) / (2s+2) must evaluate as (1) / (s+1), not raw coeffs
+    const double d0 = den[0];
+    std::vector<double> numN(num.size()), denN(den.size());
+    for (size_t i = 0; i < num.size(); ++i) numN[i] = num[i] / d0;
+    for (size_t i = 0; i < den.size(); ++i) denN[i] = den[i] / d0;
+    // --- STAGE 2: LOGARITHMIC AXIS PREPARATION ---
+    // 1. Log-spaced from 0.01 Hz to maxFreq
+    const double minFreq = 0.01;
+    maxFreq = std::max(maxFreq, 10.0);
+    const double logMin = std::log10(minFreq); // -2.0
+    const double logMax = std::log10(maxFreq);
+
+    for (int i = 0; i < N; ++i) {
+        double t = static_cast<double>(i) / (N - 1);
+
+        // 2. Frequency sample (log-spaced)
+        double f = std::pow(10.0, logMin + t * (logMax - logMin));  // Map linear index 't' to logarithmic frequency 'f'
+
+        // --- STAGE 3: COMPLEX FREQUENCY ANALYSIS ---
+        // Evaluate along the jw-axis (s = j * 2 * pi * f)
+        std::complex<double> s(0.0, 2.0 * M_PI * f);
+
+        // Evaluate H(jw) using evalPoly
+        auto dv = evalPoly(denN, s);
+        if (std::abs(dv) < 1e-300) continue;                        // Singularity avoidance (Poles on jw axis)
+
+        std::complex<double> H = evalPoly(numN, s) / dv;
+
+        // --- STAGE 4: MAGNITUDE & PHASE EXTRACTION ---
+        double a = std::abs(H);
+        if (a < 1e-300) a = 1e-300;  // guards from log(0)
+
+        d.freq .push_back(f);
+        d.mag  .push_back(20.0 * std::log10(a));            // extract magnitude
+        d.phase.push_back(std::arg(H) * 180.0 / M_PI);      // extract phase
+    }
+
+    // --- STAGE 5: PHASE UNWRAPPING ALGORITHM ---
+    // Standard arctan functions are limited to a 360-degree range.
+    // This logic prevents artificial discontinuities in the phase plot
+    // by detecting and correcting 360-degree wraps.
+    for (size_t i = 1; i < d.phase.size(); ++i) {
+        double diff = d.phase[i] - d.phase[i - 1];
+        // Wrap the step into (-180, +180]
+        while (diff >  180.0) diff -= 360.0;
+        while (diff < -180.0) diff += 360.0;
+        d.phase[i] = d.phase[i - 1] + diff;
+    }
+
+    d.valid = !d.freq.empty();  // if the list is empty d.valid is false then and UI plots nothing
+    return d;                   // This sends complete bode data to whatever the function called 
+}
+
+/**
+ * @section TIME-DOMAIN ENGINE: STEP RESPONSE
+ * Simulates the transient behavior of the RLC network when a 1V step input is applied.
+ * Uses a State-Variable approach with Euler Integration for real-time simulation.
+ */
+
+struct StepData {
+    std::vector<double> time;
+    std::vector<double> value;
+    bool valid = false;
+};
+StepData computeStep(const std::vector<double>& num,
+                     const std::vector<double>& den,
+                     int N = 600,
+                     double userMaxTime = -1.0)
+{
+    StepData sd;
+    if (num.empty() || den.empty() || den[0] == 0) return sd; // Safety check: Denominator must be of higher or equal order than numerator
+    if (num.size() > den.size()) return sd;
+
+    // --- STAGE 1: SYSTEM NORMALIZATION ---
+    double factor = den[0];
+    std::vector<double> a, b;
+    for (double v : den) a.push_back(v / factor);
+    for (double v : num) b.push_back(v / factor);
+    while (b.size() < a.size()) b.insert(b.begin(), 0.0);      // Zero-padding the numerator to match denominator order for state-space indexing
+
+    // --- STAGE 2: AUTO-SCALING TIME AXIS ---
+    // Calculates natural frequency (wn) and damping ratio (zeta) 
+    // to determine how long the simulation should run (Settling Time).
+    double tEnd = userMaxTime;
+    if (tEnd <= 0) {
+        double wn_sq = std::abs(a.back());
+        double wn = (wn_sq > 0) ? std::sqrt(wn_sq) : 1e-4;
+        double zeta_raw = (a.size() > 2 && wn > 1e-9) ? (a[a.size()-2] / (2.0 * wn)) : 1.0;
+        double zeta = std::isfinite(zeta_raw) ? std::clamp(zeta_raw, 0.001, 100.0) : 1.0;
+
+        if (wn > 1e-4) {  // Use 4 / (zeta * wn) rule for 2nd-order settling time
+            tEnd = (zeta > 0.1) ? (8.0 / (zeta * wn)) : (15.0 / wn);
+        } else {
+            tEnd = 10.0;
+        }
+        if (!std::isfinite(tEnd) || tEnd <= 0) tEnd = 10.0; 
+        tEnd = std::clamp(tEnd, 1e-15, 1e6);
+    }
+
+    int n = a.size() - 1;               // System Order
+    std::vector<double> x(n, 0.0);      // State Vector (Integrators)
+
+    // dt must be small enough for numerical stability: cap at T_natural/50
+    double wn_est = (std::abs(a.back()) > 0) ? std::sqrt(std::abs(a.back())) : 1.0;
+    double dt_max_stability = (wn_est > 1e-6) ? (2.0 * M_PI / wn_est / 50.0) : 0.01;
+    double dt_calc = std::min(tEnd / 2000.0, dt_max_stability);
+    if (dt_calc <= 0 || !std::isfinite(dt_calc)) dt_calc = tEnd / 2000.0;
+    dt_calc = std::clamp(dt_calc, tEnd / 1000000.0, 0.1);
+
+    long long totalSteps = static_cast<long long>(tEnd / dt_calc);
+    int sampleRate = (totalSteps > N) ? (totalSteps / N) : 1; 
+
+    // --- STAGE 3: INTEGRATION LOOP (Control Canonical Form) ---
+    for (long long i = 0; i <= totalSteps; ++i) {
+        double t = i * dt_calc;
+        double u = 1.0; // Unit Step Input
+
+        // Calculate the derivative of the highest state.
+        double x_dot_top = u;
+        for (int j = 1; j <= n; ++j) {
+            x_dot_top -= a[j] * x[n - j];
+        }
+
+        // Output Equation: y = Cx + Du
+        // Combines internal states to produce the physical output (Voltage/Current)
+        double y = 0;
+        for (int j = 0; j < n; ++j) {
+            y += b[n - j] * x[j]; 
+        }
+        if (num.size() == den.size()) {
+            y += b[0] * x_dot_top;
+        }
+        // Downsampling: Only store 'N' points for smooth render.
+        if (i % sampleRate == 0 || i == totalSteps) {
+            if (std::isfinite(y)) {
+                sd.time.push_back(t);
+                sd.value.push_back(y);
+            }
+        }
+
+        // --- STAGE 4: STATE UPDATE (Euler's Method) ---
+        if (n > 0) {
+            std::vector<double> x_dot(n);
+            for (int j = 0; j < n - 1; ++j) {
+                x_dot[j] = x[j+1];          // derivative of state is the next state
+            }
+            x_dot[n-1] = x_dot_top;
+
+            for (int j = 0; j < n; ++j) {
+                x[j] += x_dot[j] * dt_calc; // x(t + dt) = x(t) + x_dot * dt
+            }
+        }
+
+        // Safety break to prevent "random numbers" if system is unstable
+        if (n > 0 && std::abs(x[0]) > 1e12) break; 
+
+    } 
+
+    sd.valid = true;
+    return sd;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+//  RLC SUB-STEPPING STEP RESPONSE  
+//  * Adaptive sub-steps: ensures dt << T_natural to prevent numerical explosion
+//  * Correct per-filter output equations for LP / HP / BP
+//  * Full division-by-zero guards; NaN/Inf checks every step
+//  * High-Q (low damping) circuits use much finer internal_dt automatically
+// ─────────────────────────────────────────────────────────────────────────────
+StepData computeStepRLC(double R, double L, double C,
+                         CircuitType ct,
+                         int N = 600,
+                         double userMaxTime = -1.0)
+{
+    StepData sd;
+
+    // --- STAGE 1: PHYSICAL PARAMETER VALIDATION ---
+    if (C < 1e-30) return sd;   // no capacitor >> undefined circuit
+    const bool hasL = (L > 1e-15);
+
+    // --- STAGE 2: NETWORK CHARACTERISTIC CALCULATION ---
+    double wn = 0.0;        // natural frequency (rad/s)
+    double zeta = 1.0;      // damping ratio 
+
+    if (hasL) {
+        // Second-order RLC:  wn = 1/sqrt(LC),  zeta = R/(2) * sqrt(C/L) << Standard 2nd-order RLC formulas
+        double LC = L * C;
+        if (LC < 1e-60) return sd;  // would produce astronomical wn
+        wn = 1.0 / std::sqrt(LC);
+        double denom = 2.0 * wn * L;
+        zeta = (std::abs(denom) > 1e-30) ? (R / denom) : 1e6;
+    } else { // Fallback to 1st-order RC behavior
+            // First-order RC:  time constant tau = RC
+        double tau = R * C;
+        if (tau < 1e-30) tau = 1e-15;
+        wn = 1.0 / tau;   // treat 1/tau as "natural frequency"
+        zeta = 1.0;       // first-order is always critically damped
+    }
+
+    if (!std::isfinite(wn) || wn <= 0.0) wn = 1.0;
+    if (!std::isfinite(zeta))            zeta = 1.0;
+
+    // --- STAGE 3: DYNAMIC TIME-WINDOWING ---
+    double tEnd;
+    if (userMaxTime > 0.0) {
+        tEnd = userMaxTime;
+    } else if (hasL) { 
+        // For underdamped systems (zeta < 1), we extend the window to show 'ringing'
+        // Settle time ≈ 5 / (zeta * wn) for second-order; add extra for low damping
+        double settleFreq = std::max(zeta * wn, 1e-6);
+        tEnd = (zeta < 0.05) ? (30.0 * M_PI / wn)   // high-Q: show many cycles
+                             : (8.0  / settleFreq);
+    } else {
+        tEnd = 5.0 / wn;                            // Standard 5-tau settling time for RC
+    }
+    tEnd = std::clamp(tEnd, 1e-15, 1e6);
+    if (!std::isfinite(tEnd) || tEnd <= 0.0) tEnd = 1.0;
+
+    // --- STAGE 4: ADAPTIVE SUB-STEPPING (Stability Guard) ---
+    // We need at least 50 Euler steps per natural period for stability.
+    // For very high-Q (low zeta), 200+ steps per period are needed.
+    double T_nat = 2.0 * M_PI / wn;  // natural period (seconds)
+    int stepsPerPeriod = (zeta < 0.1) ? 500 : (zeta < 0.5) ? 200 : 50;
+    double maxDt = T_nat / stepsPerPeriod;
+    // Also cap so we don't take forever for low-wn systems
+    maxDt = std::max(maxDt, tEnd / (N * 10000.0));
+
+    // Compute total sub-steps to cover tEnd at maxDt resolution
+    long long totalSubSteps = static_cast<long long>(std::ceil(tEnd / maxDt));
+    if (totalSubSteps < N)       totalSubSteps = N;
+    if (totalSubSteps > 20000000LL) totalSubSteps = 20000000LL;  // safety cap
+
+    double dt = tEnd / static_cast<double>(totalSubSteps);
+    long long sampleEvery = std::max(1LL, totalSubSteps / N);
+
+    sd.time.reserve(N + 2);
+    sd.value.reserve(N + 2);
+
+// --- STAGE 4: INTEGRATION LOOP (KVL State-Space) ---
+    // For RLC: state = [y, dy/dt] where y is the capacitor voltage (LP state)
+    // For RC:  state = [y]        where y is the capacitor voltage
+    double y = 0.0;   // capacitor voltage (LP output state)
+    double yd = 0.0;  // dy/dt (velocity)
+    bool diverged = false;
+
+    if (hasL) {
+        double RoL   = R / L;
+        double invLC = 1.0 / (L * C);
+        if (!std::isfinite(RoL) || !std::isfinite(invLC)) return sd;
+
+        // LP state variable y = V_C (capacitor voltage)
+        // Equation: y'' = (1/LC)*(u - y) - (R/L)*y'
+        // Output:
+        //   LP: out = y
+        //   HP: out = u - y - (R/L)*y' * L... simplified: u - y - RC*yd
+        //       Actually for series RLC HP: V_R = u - V_C - V_L
+        //       but we track V_C. For step: HP out = 1 - y - (R/L*yd)/invLC... 
+        //       Cleaner: track V_C directly, compute HP = u*(LC*s^2)/(LC*s^2+RC*s+1)
+        //       At step steady state HP→0, transient starts at 1. We use:
+        //       HP out = input - y  - (L/wn²)*yd  is not exact; instead simulate:
+        //       HP = u - LP - BP  where BP output needs separate tracking.
+        //   BP: V_R = R * I = R * C * dV_C/dt = RC * yd
+
+        for (long long step = 0; step <= totalSubSteps && !diverged; ++step) {
+            double t = step * dt;
+            double u = 1.0; // unit step input
+
+            // Record physical outputs based on Filter Type
+            if (step % sampleEvery == 0 || step == totalSubSteps) {
+                double out = 0.0;
+                switch (ct) {
+                    case CircuitType::LowPass:  out = y;              break; // V_C
+                    case CircuitType::HighPass: out = u - y - R*C*yd; break; // V_L
+                    case CircuitType::BandPass: out = R * C * yd;     break; // V_R
+                }
+                if (std::isfinite(out)) {
+                    sd.time.push_back(t);
+                    sd.value.push_back(out);
+                }
+            }
+
+            // Numerical Integration using KVL: u = L(di/dt) + Ri + V_C
+            // Simplified to: y'' = (u - y)/LC - (R/L)y'
+            double accel = invLC * (u - y) - RoL * yd;
+            if (!std::isfinite(accel)) { diverged = true; break; }
+            yd += accel * dt;
+            y  += yd    * dt;
+            // Explosion Guard: Stop simulation if values become non-physical
+            if (!std::isfinite(y) || !std::isfinite(yd) ||
+                std::abs(y) > 1e10 || std::abs(yd) > 1e15) {
+                diverged = true;
+            }
+        }
+    } else {
+        // First-order RC: dy/dt = (u - y) / (R*C) Similar to above
+        double RC = R * C;
+        double invRC = (RC > 1e-30) ? 1.0 / RC : 1.0;
+
+        for (long long step = 0; step <= totalSubSteps && !diverged; ++step) {
+            double t = step * dt;
+            double u = 1.0;
+
+            if (step % sampleEvery == 0 || step == totalSubSteps) {
+                double out = (ct == CircuitType::HighPass) ? (u - y) : y;
+                if (std::isfinite(out)) {
+                    sd.time.push_back(t);
+                    sd.value.push_back(out);
+                }
+            }
+
+            double dydt = invRC * (u - y);
+            if (!std::isfinite(dydt)) { diverged = true; break; }
+            y += dydt * dt;
+
+            if (!std::isfinite(y) || std::abs(y) > 1e10) diverged = true;
+        }
+    }
+
+    sd.valid = !sd.time.empty();
+    return sd;
+}
+
+/**
+ * @section ROOT-FINDING ENGINE: DURAND-KERNER ALGORITHM
+ * Simultaneously finds all complex roots (Poles/Zeros) of a polynomial.
+ * Essential for stability analysis and identifying resonant frequencies.
+ */
+
+std::vector<std::complex<double>> durandKerner(const std::vector<double>& coeffs,
+                                               int maxIter = 300)
+{
+    // A polynomial of degree N must have N+1 coefficients to have N roots.
+    if (coeffs.size() < 2) return {};
+    int n = static_cast<int>(coeffs.size()) - 1;
+    double a0 = coeffs[0];
+    if (std::abs(a0) < 1e-300) return {};
+    // --- STAGE 1: INITIALIZATION (Complex Unit Circle) ---
+    // We place initial guesses in a circular pattern in the complex s-plane.
+    // This broken symmetry prevents the roots from collapsing into each other.
+    std::vector<std::complex<double>> p(n), pnew(n);
+    for (int i = 0; i < n; ++i) {
+        double angle = 2.0 * M_PI * i / n;
+        p[i] = 0.4 * std::complex<double>(std::cos(angle), std::sin(angle));
+    }
+    // Convert to a monic polynomial (leading coefficient = 1) for easier math.
+    std::vector<double> monic(coeffs.size());
+    for (int i = 0; i < (int)coeffs.size(); ++i) monic[i] = coeffs[i] / a0;
+    // --- STAGE 2: ITERATIVE REFINEMENT ---
+    for (int iter = 0; iter < maxIter; ++iter) {
+        bool converged = true;
+        for (int i = 0; i < n; ++i) {
+            // Calculate the Weierstrass product: the 'repulsion' force from other roots
+            std::complex<double> denom{1, 0};
+            for (int j = 0; j < n; ++j)
+                if (j != i) denom *= (p[i] - p[j]);
+            // Evaluate the polynomial at the current guess
+            std::complex<double> num_val = evalPoly(monic, p[i]);
+            if (std::abs(denom) < 1e-300) continue;
+            // The Durand-Kerner update step
+            pnew[i] = p[i] - num_val / denom;
+            // Check if the change is small enough to stop (Tolerance = 1e-10)
+            if (std::abs(pnew[i] - p[i]) > 1e-10) converged = false;
+        }
+        p = pnew;
+        if (converged) break; // Exit early if roots have stabilized
+    }
+    return p;  // Returns the vector of complex Poles or Zeros
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  COMPUTE NYQUIST  — full whirls with adaptive pole-aware sampling
+//
+//  Strategy:
+//  1. Sweep ω from 0 → +∞ using log spacing from 1e-2 Hz to 1e8 Hz.
+//  2. Around each complex pole magnitude, add a high-density cluster of
+//     points so the resonant "whirl" is fully traced (not skipped).
+//  3. Mirror to get ω: -∞ → 0  (conjugate of the positive sweep, reversed).
+//  4. Close the path at the origin (ω→∞ → 0+j0).
+//  The combined positive + negative sweep produces the complete double whirl.
+// ─────────────────────────────────────────────────────────────────────────────
+struct NyquistData {
+    bool valid = false;
+    std::vector<double> re;
+    std::vector<double> im;
+    std::vector<double> freq;
+    // Index of first point belonging to the reflected (negative-frequency) sweep.
+    // Points [0, posCount) are the calculated positive-frequency data → drawn solid.
+    // Points [posCount, end) are the conjugate mirror H(-jω)        → drawn dashed.
+    size_t posCount = 0;
+};
+NyquistData computeNyquist(const std::vector<double>& num,
+                            const std::vector<double>& den,
+                            double /*maxFreq*/ = 1e6,
+                            int /*N*/ = 700)
+{
+    NyquistData nd;
+    if (num.empty() || den.empty()) return nd;
+
+    // ── 1. Build adaptive frequency vector ────────────────────────────────────
+    // Base log sweep: 100 points/decade from 1e-2 to 1e8 Hz
+    const double fLo  = 1e-2;
+    const double fHi  = 1e8;
+    const int    BASE = 120;   // points per decade
+    const int    DEC  = static_cast<int>(std::log10(fHi / fLo) + 0.5); // ~10 decades
+
+    std::vector<double> freqs;
+    freqs.reserve(BASE * DEC + 600);
+
+    for (int d = 0; d < DEC; ++d) {
+        double f0 = fLo * std::pow(10.0, d);
+        double f1 = f0 * 10.0;
+        for (int k = 0; k < BASE; ++k) {
+            double t = static_cast<double>(k) / BASE;
+            freqs.push_back(f0 * std::pow(10.0, t));
+            (void)f1;
+        }
+    }
+    freqs.push_back(fHi);
+
+    // ── 2. Find resonant frequencies from poles and add dense clusters ────────
+    auto poles = durandKerner(den);
+    for (auto& pole : poles) {
+        // Only LHP poles with imaginary part (resonant modes)
+        double sigma = pole.real();
+        double omega = std::abs(pole.imag()); // rad/s
+        if (omega < 1.0) continue;           // no resonance below 1 rad/s
+        double fRes = omega / (2.0 * M_PI);  // Hz
+
+        // Cluster: ±3 decades around fRes, 400 points
+        double fClLo = std::max(fLo, fRes * 1e-3);
+        double fClHi = std::min(fHi, fRes * 1e3);
+        int    CLN   = 600;
+        for (int k = 0; k < CLN; ++k) {
+            double t = static_cast<double>(k) / (CLN - 1);
+            freqs.push_back(fClLo * std::pow(fClHi / fClLo, t));
+        }
+        (void)sigma;
+    }
+
+    // Sort and deduplicate
+    std::sort(freqs.begin(), freqs.end());
+    freqs.erase(std::unique(freqs.begin(), freqs.end()), freqs.end());
+
+    // ── 3. Evaluate H(j2πf) for positive frequencies ─────────────────────────
+    // We store (re, im) for f > 0 sweep, then mirror for the negative sweep.
+    std::vector<double> posRe, posIm;
+    posRe.reserve(freqs.size());
+    posIm.reserve(freqs.size());
+
+    for (double f : freqs) {
+        std::complex<double> s(0.0, 2.0 * M_PI * f);
+        auto dv = evalPoly(den, s);
+        if (std::abs(dv) < 1e-300) continue;
+        std::complex<double> H = evalPoly(num, s) / dv;
+        if (!std::isfinite(H.real()) || !std::isfinite(H.imag())) continue;
+        posRe.push_back(H.real());
+        posIm.push_back(H.imag());
+    }
+
+    if (posRe.empty()) return nd;
+
+    // ── 4. Assemble: positive sweep (ω: 0→+∞) then negative (ω: -∞→0) ───────
+    // The negative-frequency sweep is the complex conjugate, traversed in
+    // reverse, which produces the lower half of the Nyquist diagram.
+
+    // Positive sweep (upper half)
+    for (size_t i = 0; i < posRe.size(); ++i) {
+        nd.re.push_back(posRe[i]);
+        nd.im.push_back(posIm[i]);
+    }
+
+    // Mark the boundary: everything up to here is solid (calculated data).
+    nd.posCount = nd.re.size();
+
+    // Close at origin / large frequency point (ω→+∞ approaches origin for
+    // proper systems) — already included as last point
+    // Bridge: small gap to connect upper arc end to lower arc start
+    nd.re.push_back(posRe.back());
+    nd.im.push_back(0.0); // approach real axis
+
+    // Negative-frequency sweep (lower half): conjugate, reversed
+    for (int i = static_cast<int>(posRe.size()) - 1; i >= 0; --i) {
+        nd.re.push_back(posRe[i]);
+        nd.im.push_back(-posIm[i]);  // conjugate
+    }
+
+    // Close the loop back to the DC starting point
+    if (!nd.re.empty()) {
+        nd.re.push_back(nd.re.front());
+        nd.im.push_back(nd.im.front());
+    }
+
+    nd.valid = !nd.re.empty();
+    return nd;
+}
+
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  STABILITY ANALYZER  — v2 (corrected engineering logic)
+//
+//  Terminology:
+//    fcHz   : Bandwidth / Cutoff  — freq where |H| drops to peak×0.7071 (−3dB)
+//    fgcHz  : Gain Crossover      — freq where |H| = 1.0 (0 dB) for PM
+//    fpiHz  : Phase Crossover     — freq where phase crosses −180°  for GM
+//    pmDeg  : Phase Margin        — 180° + phase(fgc),  normalised to (−180,180]
+//    gmDb   : Gain Margin         — −20·log10(|H(fpi)|)
+//
+//  Note: d.mag contains LINEAR magnitude (not dB).  d.phase is in degrees.
+// ─────────────────────────────────────────────────────────────────────────────
+class StabilityAnalyzer {
+public:
+    struct Result {
+        bool   valid    = false;
+        // ── Bandwidth / cutoff (performance metric) ──────────────────────────
+        bool   hasFc    = false;
+        double fcHz     = 0.0;
+        // ── Gain crossover + Phase Margin (stability metric) ─────────────────
+        bool   hasFgc   = false;
+        double fgcHz    = 0.0;
+        double pmDeg    = std::numeric_limits<double>::quiet_NaN();
+        bool   pmStable = false;
+        // ── Phase crossover + Gain Margin (stability metric) ─────────────────
+        bool   hasFpi   = false;
+        double fpiHz    = 0.0;
+        double gmDb     = std::numeric_limits<double>::quiet_NaN();
+        bool   gmStable = false;
+        // ── Pole/zero info ────────────────────────────────────────────────────
+        bool   stable   = false;
+        bool   rhpPole  = false;
+        std::vector<std::complex<double>> poles;
+        std::vector<std::complex<double>> zeros;
+
+        // ── Legacy aliases so existing drawing code compiles unchanged ────────
+        bool   hasFc_alias() const { return hasFgc; } // PM-related crossover
+    };
+
+    static Result analyze(const BodeData& d,
+                          const std::vector<double>& numCoeffs,
+                          const std::vector<double>& denCoeffs)
+    {
+        Result r;
+        if (!d.valid || d.freq.size() < 2) return r;
+
+        // ── Helpers ──────────────────────────────────────────────────────────
+
+        // Log-interpolated frequency crossing of target in vector v[].
+        // dir: +1=falling, -1=rising, 0=either.  last=true => last crossing.
+        // Returns -1.0 if not found.
+        auto findCrossing = [&](const std::vector<double>& v,
+                                double target, bool last, int dir) -> double
+        {
+            double result = -1.0;
+            for (size_t i = 1; i < v.size(); ++i) {
+                double v0 = v[i-1], v1 = v[i];
+                bool falling = (v0 >= target && v1 <= target);
+                bool rising  = (v0 <= target && v1 >= target);
+                bool cross   = (dir == 0) ? (falling || rising)
+                             : (dir > 0)  ? falling : rising;
+                if (!cross) continue;
+                double dv = v1 - v0;
+                double t  = (std::abs(dv) > 1e-30) ? (target - v0) / dv : 0.0;
+                t = std::clamp(t, 0.0, 1.0);
+                double logF = std::log10(d.freq[i-1]) +
+                              (std::log10(d.freq[i]) - std::log10(d.freq[i-1])) * t;
+                double fCross = std::pow(10.0, logF);
+                if (!last) return fCross;
+                result = fCross;
+            }
+            return result;
+        };
+
+        // Linearly interpolate v at frequency fTarget
+        auto interpAt = [&](const std::vector<double>& v, double fTarget) -> double {
+            for (size_t i = 1; i < d.freq.size(); ++i) {
+                if (d.freq[i-1] <= fTarget && d.freq[i] >= fTarget) {
+                    double t = (d.freq[i] > d.freq[i-1])
+                             ? (fTarget - d.freq[i-1]) / (d.freq[i] - d.freq[i-1])
+                             : 0.0;
+                    return v[i-1] + (v[i] - v[i-1]) * t;
+                }
+            }
+            return v.back();
+        };
+
+        // ── Step 1: Classify system trend (Low-Pass vs High-Pass/Improper) ──
+        // Compare first and last magnitude values to determine the trend.
+        double magFirst = d.mag.front();   // linear magnitude at lowest frequency
+        double magLast  = d.mag.back();    // linear magnitude at highest frequency
+        bool isHighPassTrend = (magLast > magFirst * 1.05); // 5% tolerance
+
+        // Also detect "zero at DC": mag[0] is effectively zero (pure diff / HP)
+        bool dcNearZero = (magFirst < 1e-4);  // DC gain < ~−80 dB
+
+        // ── Step 2: Cutoff Frequency (fc) ─────────────────────────────────────
+        if (dcNearZero) {
+            // Pure differentiator / zero at origin — fc is undefined
+            r.hasFc = false;
+        } else if (isHighPassTrend) {
+            // High-pass / improper: find +3 dB RISE from DC level
+            // target = DC_magnitude * √2
+            double targetRise = magFirst * 1.41421356;
+            double fRise = findCrossing(d.mag, targetRise, false, -1); // first rising
+            if (fRise > 0.0) { r.fcHz = fRise; r.hasFc = true; }
+        } else {
+            // Standard LP/BP: find last falling crossing of peak*0.7071
+            double peakMag = *std::max_element(d.mag.begin(), d.mag.end());
+            if (peakMag < 1e-12) peakMag = 1e-12;
+            double target3dB = peakMag * 0.7071067811865476;
+            double fFall = findCrossing(d.mag, target3dB, true,  +1); // last falling
+            double fRise = findCrossing(d.mag, target3dB, false, -1); // first rising
+            if (fFall > 0.0)      { r.fcHz = fFall; r.hasFc = true; }
+            else if (fRise > 0.0) { r.fcHz = fRise; r.hasFc = true; }
+        }
+
+        // ── Step 3: Gain Crossover (|H| = 1.0) with shelf-filter guard ───────
+        //
+        // Rules:
+        //  A. Only count if the crossing has a clear trend (swing > 1 dB).
+        //  B. Don't count if final magnitude settles at ~0 dB (shelf/asymptote).
+        //  C. Don't count if first point IS 0 dB (start-of-sweep artefact).
+        //  D. Search left-to-right; take the FIRST valid crossing and break
+        //     immediately — do NOT continue scanning after finding one.
+        //
+        const double CROSS_THRESH_HI = 1.0593; // +0.5 dB
+        const double CROSS_THRESH_LO = 0.9441; // −0.5 dB
+        const double SHELF_TOL       = std::pow(10.0, 0.1/20.0) - 1.0; // ±0.1 dB
+
+        // B: detect shelf/asymptote — final mag within ±0.1 dB of 1.0
+        bool endIsShelf = (std::abs(magLast - 1.0) < SHELF_TOL);
+
+        if (!endIsShelf) {
+            for (size_t i = 1; i < d.mag.size(); ++i) {
+                double m0 = d.mag[i-1], m1 = d.mag[i];
+
+                // C: skip if first sample is already at 0 dB
+                if (i == 1 && std::abs(m0 - 1.0) < SHELF_TOL) continue;
+
+                bool falling = (m0 >= 1.0 && m1 <= 1.0);
+                bool rising  = (m0 <= 1.0 && m1 >= 1.0);
+                if (!falling && !rising) continue;
+
+                // A: strict breakthrough threshold — swing must exceed 1 dB
+                if (falling && !(m0 >= CROSS_THRESH_HI && m1 <= CROSS_THRESH_LO)) continue;
+                if (rising  && !(m0 <= CROSS_THRESH_LO && m1 >= CROSS_THRESH_HI)) continue;
+
+                double dv = m1 - m0;
+                double t  = (std::abs(dv) > 1e-30) ? (1.0 - m0) / dv : 0.0;
+                t = std::clamp(t, 0.0, 1.0);
+                double logF = std::log10(d.freq[i-1]) +
+                              (std::log10(d.freq[i]) - std::log10(d.freq[i-1])) * t;
+                r.fgcHz  = std::pow(10.0, logF);
+                r.hasFgc = true;
+
+                // ── Phase Margin —────────────────────────────────────────────
+                // PM = angular distance from the phase at fgc to the critical
+                // instability boundary at −180°.
+                //
+                // Formula:  PM = phase(fgc) − (−180°)  =  phase(fgc) + 180°
+                //
+                // BUT we must wrap the result into (−180°, +180°] using a
+                // *symmetric* modulo so that both LP and HP filters are handled
+                // correctly:
+                //
+                //   LP example:  phase = −8.6°  → raw = 171.4° → PM = +171.4°  ✓
+                //   HP example:  phase = +171.4° → raw = 351.4° → naive wrap
+                //                gives −8.6°  ✗   WRONG — system is passive/stable!
+                //
+                // The key insight: for a passive HP filter the unwrapped phase
+                // *starts* near +180° and decreases.  The distance to −180° is
+                // measured mod 360 on the circle, and both +171.4° and −171.4°
+                // are equally 8.6° away from the ±180° boundary — both stable.
+                //
+                // Correct wrap: fold into (−180°, +180°] then take absolute
+                // distance interpretation: PM > 0 ⟺ |PM| < 180°.
+                // We keep the sign so the UI can show it, but stability is
+                // determined by |PM| being in the interior of (−180°, +180°).
+                double phAtFgc = interpAt(d.phase, r.fgcHz);
+
+                // Step 1: raw distance to −180° boundary on the phase circle
+                double rawPm = phAtFgc - (-180.0);   // = phAtFgc + 180.0
+
+                // Step 2: wrap into (−180°, +180°] using symmetric modulo
+                // std::fmod can return values up to ±360, so use a while loop
+                // for robustness with heavily-unwrapped phase traces.
+                while (rawPm >   180.0) rawPm -= 360.0;
+                while (rawPm <= -180.0) rawPm += 360.0;
+
+                // Step 3: For HP filters the phase starts at +180° and drops.
+                // After wrapping, an HP at +171.4° gives rawPm = −8.6°, which
+                // is the same magnitude as an LP at −8.6° giving rawPm = +171.4°.
+                // In both cases the magnitude |PM| = 8.6° tells us how close
+                // we are to the −180° boundary.  The sign convention below
+                // mirrors standard control-theory: PM > 0 means stable margin.
+                //
+                // For HP: wrapped value is −8.6°.  We detect the HP case by
+                // checking whether the phase at DC (d.phase.front()) is closer
+                // to +180° than to 0°.  If so, the "natural" reference is +180°,
+                // and a small negative wrapped PM still means a POSITIVE physical
+                // margin (the phase has not yet reached −180° from the other side).
+                //
+                // Implementation: reflect the sign for HP-trending systems so
+                // the displayed PM and the stability flag are both correct.
+                {
+                    // Re-use isHighPassTrend already computed above in Step 1.
+                    // For HP: phase front ≈ +180°, so the approach to -180°
+                    // is from the positive side.  A wrapped PM of -8.6° means
+                    // the phase is +171.4°, i.e. +8.6° ABOVE the +180° threshold —
+                    // which is equivalent to 360-8.6 = 351.4° away from -180°.
+                    // Physically the margin is +8.6° (safe side).
+                    // We negate the wrapped result for HP systems so the number
+                    // reads positive and pmStable evaluates correctly.
+                    if (isHighPassTrend && rawPm < 0.0) {
+                        rawPm = -rawPm;
+                    }
+                }
+
+                r.pmDeg = rawPm;
+
+                break;  // D: first valid crossing only — stop scanning immediately
+            }
+        }
+        // endIsShelf → hasFgc stays false (shelf doesn't count as crossover)
+
+        // ── Step 4: Phase Crossover — for Gain Margin ────────────────────────
+        // Standard LP case: phase crosses −180° from above.
+        // HP case: phase *starts* near +180° and descends; the instability
+        // boundary on the positive side is +180° (same point on the unit circle).
+        // We search both targets and take the first (lowest-frequency) crossing.
+        // GM formula: GM_dB = −20·log10(|H(fpi)|)  [correct dB formula]
+        // If GM > 100 dB treat as infinity (system is very stable).
+        {
+            double fpi_neg = findCrossing(d.phase, -180.0, false, 0);
+            double fpi_pos = findCrossing(d.phase, +180.0, false, 0);
+
+            // For HP: the sweep starts at +180°; that initial value is NOT a
+            // crossing — it is the DC operating point.  Suppress a +180°
+            // detection that sits at or below the second sample (start artefact).
+            if (fpi_pos > 0.0 && fpi_pos <= d.freq[1])
+                fpi_pos = -1.0;
+
+            double fpi = -1.0;
+            if      (fpi_neg > 0.0 && fpi_pos > 0.0) fpi = std::min(fpi_neg, fpi_pos);
+            else if (fpi_neg > 0.0)                   fpi = fpi_neg;
+            else if (fpi_pos > 0.0)                   fpi = fpi_pos;
+
+            if (fpi > 0.0) {
+                r.fpiHz  = fpi;
+                r.hasFpi = true;
+                double magAtFpi = interpAt(d.mag, fpi);
+                magAtFpi = std::max(magAtFpi, 1e-12);  // guard log(0)
+                double gm = -20.0 * std::log10(magAtFpi);
+                if (gm >  100.0) gm =  100.0;  // shown as "≥ 100 dB"
+                if (gm < -100.0) gm = -100.0;
+                r.gmDb = gm;
+            }
+        }
+
+        // ── Step 5: Stability flags ───────────────────────────────────────────
+        // pmStable: system is stable if there is no 0 dB crossing, OR if the
+        //   Phase Margin is positive.  After the HP fix above, pmDeg is always
+        //   the *positive* distance to the boundary, so pmDeg > 0 is correct.
+        //   We additionally guard: if |PM| == 180° the system is marginally
+        //   stable (on the boundary), treated as stable per convention.
+        r.pmStable = !r.hasFgc || (r.pmDeg > 0.0);
+
+        // gmStable: no phase-crossover found → infinite GM (stable).
+        //   If a crossing was found, stable iff GM_dB > 0 (gain < 0 dB at fpi).
+        r.gmStable = !r.hasFpi || (r.gmDb > 0.0);
+
+        // ── Step 6: Pole/zero via Durand-Kerner ──────────────────────────────
+        r.poles = durandKerner(denCoeffs);
+        r.zeros = durandKerner(numCoeffs);
+        r.rhpPole = false;
+        for (auto& pole : r.poles)
+            if (pole.real() > 1e-7) { r.rhpPole = true; break; }
+
+        r.valid  = true;
+        r.stable = !r.rhpPole && r.pmStable && r.gmStable;
+        return r;
+    }
+
+    // ── Backward-compat shim: old code checks stab.hasFc for PM display ──────
+    // The sidebar drawing uses hasFc for fcHz and PM — we redirect it to hasFgc.
+    // This is handled in the drawing code below; the Result struct keeps both
+    // hasFc (bandwidth) and hasFgc (gain crossover) separate.
+};
+// ─────────────────────────────────────────────────────────────────────────────
+//  COORDINATE CONSTANT — must match computeBode minFreq (0.01 Hz)
+// ─────────────────────────────────────────────────────────────────────────────
+static constexpr double LOG_MIN_FREQ = -2.0; // log10(0.01 Hz)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GHOST TRACE 
+// ─────────────────────────────────────────────────────────────────────────────
+struct SavedScale {
+    double magMin = -80, magMax =  40;
+    double phMin  = -200, phMax =  50;
+    double logMinFreq = -2.0;   // log10(0.01 Hz) — must match computeBode
+    double logMaxFreq =  6.0;   // log10(maxFreq)
+};
+
+class TraceManager {
+public:
+    std::vector<sf::Vertex> ghostMag, ghostPhase;
+
+    // Raw Bode data saved at ghost-capture time
+    std::vector<double> ghostFreq, ghostMagRaw, ghostPhaseRaw;
+    SavedScale ghostScale;
+    bool hasGhost = false;
+
+    void saveFromBode(const BodeData& d,
+                      double magMin, double magMax,
+                      double phMin,  double phMax,
+                      double logMaxFreq = 6.0)
+    {
+        ghostMag.clear(); ghostPhase.clear(); hasGhost = false;
+        ghostFreq.clear(); ghostMagRaw.clear(); ghostPhaseRaw.clear();
+        if (!d.valid || d.freq.empty()) return;
+
+        // Save scale so SVG builder can reconstruct correctly
+        ghostScale = { magMin, magMax, phMin, phMax, LOG_MIN_FREQ, logMaxFreq };
+
+        auto norm01 = [](double v, double mn, double mx) -> float {
+            if (std::abs(mx - mn) < 1e-12) return 0.5f;
+            return static_cast<float>(std::clamp((v - mn)/(mx - mn), 0.0, 1.0));
+        };
+        for (size_t i = 0; i < d.freq.size(); ++i) {
+            // Normalise x using the SAME log mapping as freqToX()
+            double logF = std::log10(d.freq[i]);
+            float xf = static_cast<float>(
+                std::clamp((logF - LOG_MIN_FREQ) / (logMaxFreq - LOG_MIN_FREQ), 0.0, 1.0));
+            ghostMag  .push_back(sf::Vertex{{xf, norm01(d.mag[i],   magMin, magMax)}, T.ghost});
+            ghostPhase.push_back(sf::Vertex{{xf, norm01(d.phase[i], phMin,  phMax)},  T.ghost});
+
+            // Also save raw values for the HTML exporter
+            ghostFreq     .push_back(d.freq[i]);
+            ghostMagRaw   .push_back(d.mag[i]);
+            ghostPhaseRaw .push_back(d.phase[i]);
+        }
+        hasGhost = !ghostMag.empty();
+    }
+
+    void drawGhostDashed(sf::RenderWindow& win,
+                         const std::vector<sf::Vertex>& ghost,
+                         float gx, float gy, float gw, float gh) const
+    {
+        if (ghost.size() < 2) return;
+        for (size_t i = 1; i < ghost.size(); ++i) {
+            if (((i / 2) % 2) == 1) continue;
+            sf::Vector2f p0 = ghost[i-1].position;
+            sf::Vector2f p1 = ghost[i].position;
+            sf::Vector2f a{gx + p0.x * gw, gy + (1.f - p0.y) * gh};
+            sf::Vector2f b{gx + p1.x * gw, gy + (1.f - p1.y) * gh};
+            sf::Vector2f mid = (a + b) * 0.5f;
+            sf::Vertex v[2] = {sf::Vertex{a, T.ghost}, sf::Vertex{mid, T.ghost}};
+            win.draw(v, 2, sf::PrimitiveType::Lines);
+        }
+    }
+};
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GET DOWNLOADS PATH  — USERPROFILE on Windows, HOME on Linux/macOS
+// ─────────────────────────────────────────────────────────────────────────────
+std::string getDownloadsPath()
+{
+    const char* up = std::getenv("USERPROFILE");   // Windows
+    if (!up) up   = std::getenv("HOME");           // Linux / macOS
+    if (!up) return "";
+    std::string base(up);
+    // Normalise separators
+    for (auto& c : base) if (c == '\\') c = '/';
+    return base + "/Downloads/";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  INLINE SVG PLOT HELPERS  — generate SVG strings for the HTML report
+// ─────────────────────────────────────────────────────────────────────────────
+static std::string makeSvgPolyline(const std::vector<std::pair<float,float>>& pts,
+                                   const std::string& stroke = "#ff8c00",
+                                   float strokeW = 2.5f)
+{
+    if (pts.empty()) return "";
+    std::ostringstream o;
+    o << "<polyline fill='none' stroke='" << stroke
+      << "' stroke-width='" << strokeW << "' stroke-linejoin='round'"
+      << " stroke-linecap='round' points='";
+    for (auto& p : pts) o << p.first << "," << p.second << " ";
+    o << "'/>";
+    return o.str();
+}
+
+static std::string svgFrame(const std::string& inner, const std::string& title,
+                             int W = 760, int H = 280)
+{
+    std::ostringstream o;
+    o << "<svg xmlns='http://www.w3.org/2000/svg' width='" << W << "' height='" << H << "'"
+      << " style='background:#141414;border:1px solid #444;display:block;margin:8px auto;"
+      << "border-radius:4px;overflow:visible'>"
+      << "<text x='8' y='16' font-size='12' fill='#ff8c00' font-family='monospace' font-weight='bold'>"
+      << title << "</text>"
+      << inner
+      << "</svg>";
+    return o.str();
+}
+
+// ── SVG grid helpers ────────────────────────────────────────────────────────
+// LAYOUT: SVG has a title row at y=0..24. Plot area: [pad, 24] to [W-pad, H-pad_bot]
+// pad     = left/right padding for Y-axis labels
+// pad_bot = bottom padding for X-axis labels
+static const int SVG_TOP  = 26;   // top of plot area (below title)
+static const int SVG_PBOT = 28;   // bottom padding (for X labels)
+
+static std::string svgHGrid(double mn, double mx, int W, int H, int pad)
+{
+    std::ostringstream o;
+    double range = mx - mn;
+    if (range < 1e-12) return "";
+    int plotTop = SVG_TOP;
+    int plotBot = H - SVG_PBOT;
+    double plotH = plotBot - plotTop;
+
+    double rs  = range / 6.0;
+    double mag = std::pow(10.0, std::floor(std::log10(std::abs(rs) + 1e-300)));
+    double nm  = rs / mag;
+    double nc  = (nm < 1.5) ? 1 : (nm < 3.5) ? 2 : (nm < 7.5) ? 5 : 10;
+    double step = nc * mag;
+
+    for (double v = std::ceil(mn / step) * step; v <= mx + step * 0.01; v += step) {
+        // py maps data value v -> pixel y (top=plotTop, bottom=plotBot)
+        float py = static_cast<float>(plotBot - (v - mn) / range * plotH);
+        if (py < plotTop - 1 || py > plotBot + 1) continue;
+        bool zero = std::abs(v) < step * 0.01;
+        o << "<line x1='" << pad << "' y1='" << py << "' x2='" << (W - pad)
+          << "' y2='" << py << "' stroke='" << (zero ? "#666" : "#2e2e2e")
+          << "' stroke-width='" << (zero ? "1.2" : "0.7") << "'/>";
+        // Y label (right-aligned, left of plot)
+        std::ostringstream lbl;
+        if (std::abs(v) >= 1000 || (std::abs(v) < 0.01 && v != 0))
+            lbl << std::scientific << std::setprecision(1) << v;
+        else
+            lbl << std::fixed << std::setprecision(std::abs(v) < 10 ? 2 : 0) << v;
+        o << "<text x='" << (pad - 4) << "' y='" << (py + 4) << "'"
+          << " font-size='10' fill='#888' text-anchor='end' font-family='monospace'>"
+          << lbl.str() << "</text>";
+    }
+    return o.str();
+}
+
+static std::string svgVGridLog(double logMin, double logMax, int W, int H, int pad)
+{
+    std::ostringstream o;
+    float plotW = W - 2 * pad;
+    int plotTop = SVG_TOP;
+    int plotBot = H - SVG_PBOT;
+
+    int decStart = static_cast<int>(std::floor(logMin));
+    int decEnd   = static_cast<int>(std::ceil(logMax));
+
+    for (int d = decStart; d <= decEnd; ++d) {
+        for (int m = 1; m <= 9; ++m) {
+            double logF = std::log10(static_cast<double>(m)) + d;
+            if (logF < logMin || logF > logMax) continue;
+            float px = pad + static_cast<float>((logF - logMin) / (logMax - logMin)) * plotW;
+            bool maj = (m == 1);
+            o << "<line x1='" << px << "' y1='" << plotTop << "' x2='" << px
+              << "' y2='" << plotBot << "' stroke='" << (maj ? "#444" : "#252525")
+              << "' stroke-width='" << (maj ? "1.0" : "0.5") << "'/>";
+            if (maj) {
+                double fval = std::pow(10.0, d);
+                std::ostringstream lbl;
+                if      (fval >= 1e9) lbl << std::fixed << std::setprecision(0) << fval/1e9 << "G";
+                else if (fval >= 1e6) lbl << std::fixed << std::setprecision(0) << fval/1e6 << "M";
+                else if (fval >= 1e3) lbl << std::fixed << std::setprecision(0) << fval/1e3 << "k";
+                else                  lbl << std::fixed << std::setprecision(0) << fval;
+                o << "<text x='" << px << "' y='" << (H - 4) << "'"
+                  << " font-size='10' fill='#777' text-anchor='middle' font-family='monospace'>"
+                  << lbl.str() << "Hz</text>";
+            }
+        }
+    }
+    return o.str();
+}
+// Helper: map a log-freq value to SVG X pixel
+static float svgFreqToPx(double freq, double logMin, double logMax, int W, int pad) {
+    double lf = std::log10(std::max(freq, 1e-300));
+    float t = static_cast<float>(std::clamp((lf - logMin) / (logMax - logMin), 0.0, 1.0));
+    return pad + t * (W - 2*pad);
+}
+
+// Helper: map a Y data value to SVG Y pixel
+static float svgValToPy(double val, double mn, double mx, int H) {
+    int plotTop = SVG_TOP;
+    int plotBot = H - SVG_PBOT;
+    double t = std::clamp((val - mn) / (mx - mn), 0.0, 1.0);
+    return static_cast<float>(plotBot - t * (plotBot - plotTop));
+}
+
+// Build Magnitude SVG — fixed coordinate mapping, larger, ghost-aware
+static std::string buildMagSvg(const BodeData& d,
+                                const std::vector<double>& gFreq,
+                                const std::vector<double>& gMag,
+                                const SavedScale& gs,
+                                bool hasGhost,
+                                int W = 760, int H = 280)
+{
+    if (!d.valid || d.freq.empty()) return svgFrame("", "MAGNITUDE (dB)", W, H);
+    int pad = 52;
+    double logMin = LOG_MIN_FREQ;
+    double logMax = std::log10(std::max(d.freq.back(), 1.0));
+
+    double mn = *std::min_element(d.mag.begin(), d.mag.end());
+    double mx = *std::max_element(d.mag.begin(), d.mag.end());
+    double pd = std::max((mx - mn) * 0.15, 10.0);
+    mn -= pd; mx += pd;
+
+    // Main trace points
+    std::vector<std::pair<float,float>> pts;
+    pts.reserve(d.freq.size());
+    for (size_t i = 0; i < d.freq.size(); ++i) {
+        float px = svgFreqToPx(d.freq[i], logMin, logMax, W, pad);
+        float py = svgValToPy(d.mag[i], mn, mx, H);
+        pts.push_back({px, py});
+    }
+
+    // Ghost trace — use ghost's own scale limits for Y, but current freq axis
+    std::string ghostSvg;
+    if (hasGhost && !gFreq.empty()) {
+        std::vector<std::pair<float,float>> gpts;
+        gpts.reserve(gFreq.size());
+        for (size_t i = 0; i < gFreq.size(); ++i) {
+            float px = svgFreqToPx(gFreq[i], logMin, logMax, W, pad);
+            float py = svgValToPy(gMag[i], mn, mx, H);
+            gpts.push_back({px, py});
+        }
+        ghostSvg = makeSvgPolyline(gpts, "#888888", 1.5f);
+        ghostSvg += "<text x='" + std::to_string(W - pad - 4) + "' y='38'"
+                    " font-size='10' fill='#888' text-anchor='end'"
+                    " font-family='monospace'>--- ghost</text>";
+    }
+
+    std::string inner = svgVGridLog(logMin, logMax, W, H, pad)
+                      + svgHGrid(mn, mx, W, H, pad)
+                      + ghostSvg
+                      + makeSvgPolyline(pts, "#ff8c00", 2.5f);
+
+    // Axis labels
+    inner += "<text x='" + std::to_string(pad - 4) + "' y='22'"
+             " font-size='10' fill='#aaa' text-anchor='end' font-family='monospace'>dB</text>";
+    inner += "<text x='" + std::to_string(W / 2) + "' y='" + std::to_string(H - 4) + "'"
+             " font-size='10' fill='#888' text-anchor='middle' font-family='monospace'>"
+             "Frequency (Hz)</text>";
+    return svgFrame(inner, "MAGNITUDE  (dB vs Hz)", W, H);
+}
+
+// Build Phase SVG — fixed coordinate mapping, larger, ghost-aware
+static std::string buildPhaseSvg(const BodeData& d,
+                                  const std::vector<double>& gFreq,
+                                  const std::vector<double>& gPhase,
+                                  const SavedScale& gs,
+                                  bool hasGhost,
+                                  int W = 760, int H = 280)
+{
+    if (!d.valid || d.freq.empty()) return svgFrame("", "PHASE (deg)", W, H);
+    int pad = 52;
+    double logMin = LOG_MIN_FREQ;
+    double logMax = std::log10(std::max(d.freq.back(), 1.0));
+
+    double mn = *std::min_element(d.phase.begin(), d.phase.end());
+    double mx = *std::max_element(d.phase.begin(), d.phase.end());
+    double pd2 = std::max((mx - mn) * 0.15, 20.0);
+    mn -= pd2; mx += pd2;
+
+    std::vector<std::pair<float,float>> pts;
+    pts.reserve(d.freq.size());
+    for (size_t i = 0; i < d.freq.size(); ++i) {
+        float px = svgFreqToPx(d.freq[i], logMin, logMax, W, pad);
+        float py = svgValToPy(d.phase[i], mn, mx, H);
+        pts.push_back({px, py});
+    }
+
+    std::string ghostSvg;
+    if (hasGhost && !gFreq.empty()) {
+        std::vector<std::pair<float,float>> gpts;
+        gpts.reserve(gFreq.size());
+        for (size_t i = 0; i < gFreq.size(); ++i) {
+            float px = svgFreqToPx(gFreq[i], logMin, logMax, W, pad);
+            float py = svgValToPy(gPhase[i], mn, mx, H);
+            gpts.push_back({px, py});
+        }
+        ghostSvg = makeSvgPolyline(gpts, "#888888", 1.5f);
+    }
+
+    std::string inner = svgVGridLog(logMin, logMax, W, H, pad)
+                      + svgHGrid(mn, mx, W, H, pad)
+                      + ghostSvg
+                      + makeSvgPolyline(pts, "#5a9fff", 2.5f);
+
+    inner += "<text x='" + std::to_string(pad - 4) + "' y='22'"
+             " font-size='10' fill='#aaa' text-anchor='end' font-family='monospace'>deg</text>";
+    inner += "<text x='" + std::to_string(W / 2) + "' y='" + std::to_string(H - 4) + "'"
+             " font-size='10' fill='#888' text-anchor='middle' font-family='monospace'>"
+             "Frequency (Hz)</text>";
+    return svgFrame(inner, "PHASE  (deg vs Hz)", W, H);
+}
+
+
+static std::string buildNyquistSvg(const NyquistData& ny, int W = 760, int H = 320)
+{
+    if (!ny.valid || ny.re.empty()) return svgFrame("", "NYQUIST", W, H);
+    int pad = 52;
+
+    double reMin = *std::min_element(ny.re.begin(), ny.re.end());
+    double reMax = *std::max_element(ny.re.begin(), ny.re.end());
+    double imMin = *std::min_element(ny.im.begin(), ny.im.end());
+    double imMax = *std::max_element(ny.im.begin(), ny.im.end());
+    reMin = std::min(reMin, -1.3); reMax = std::max(reMax, 0.3);
+    imMin = std::min(imMin, -0.3); imMax = std::max(imMax, 0.3);
+    double rePad = std::max((reMax - reMin) * 0.12, 0.1);
+    double imPad = std::max((imMax - imMin) * 0.12, 0.1);
+    reMin -= rePad; reMax += rePad;
+    imMin -= imPad; imMax += imPad;
+
+    int plotTop = SVG_TOP;
+    int plotBot = H - SVG_PBOT;
+    float plotW = W - 2.f * pad;
+    float plotH = plotBot - plotTop;
+
+    auto reToX = [&](double re) -> float {
+        return pad + static_cast<float>((re - reMin) / (reMax - reMin)) * plotW;
+    };
+    auto imToY = [&](double im) -> float {
+        return static_cast<float>(plotBot) -
+               static_cast<float>((im - imMin) / (imMax - imMin)) * plotH;
+    };
+
+    std::ostringstream grid;
+    int nGrid = 7;
+    for (int i = 0; i <= nGrid; ++i) {
+        double rv = reMin + (reMax - reMin) * i / nGrid;
+        double iv = imMin + (imMax - imMin) * i / nGrid;
+        float gx2 = reToX(rv), gy2 = imToY(iv);
+        grid << "<line x1='" << gx2 << "' y1='" << plotTop << "' x2='" << gx2
+             << "' y2='" << plotBot << "' stroke='#2e2e2e' stroke-width='0.7'/>";
+        grid << "<line x1='" << pad << "' y1='" << gy2 << "' x2='" << (W - pad)
+             << "' y2='" << gy2 << "' stroke='#2e2e2e' stroke-width='0.7'/>";
+        std::ostringstream lr; lr << std::fixed << std::setprecision(2) << rv;
+        std::ostringstream li; li << std::fixed << std::setprecision(2) << iv;
+        grid << "<text x='" << gx2 << "' y='" << (H - 4) << "'"
+             << " font-size='9' fill='#777' text-anchor='middle' font-family='monospace'>"
+             << lr.str() << "</text>";
+        grid << "<text x='" << (pad - 4) << "' y='" << (gy2 + 4) << "'"
+             << " font-size='9' fill='#777' text-anchor='end' font-family='monospace'>"
+             << li.str() << "j</text>";
+    }
+    if (reMin < 0 && reMax > 0) {
+        float ax = reToX(0);
+        grid << "<line x1='" << ax << "' y1='" << plotTop << "' x2='" << ax
+             << "' y2='" << plotBot << "' stroke='#555' stroke-width='1.2'/>";
+    }
+    if (imMin < 0 && imMax > 0) {
+        float ay = imToY(0);
+        grid << "<line x1='" << pad << "' y1='" << ay << "' x2='" << (W - pad)
+             << "' y2='" << ay << "' stroke='#555' stroke-width='1.2'/>";
+    }
+
+    std::vector<std::pair<float,float>> pts;
+    pts.reserve(ny.re.size());
+    for (size_t i = 0; i < ny.re.size(); ++i)
+        pts.push_back({reToX(ny.re[i]), imToY(ny.im[i])});
+
+    float cpx = reToX(-1.0), cpy = imToY(0.0);
+    std::ostringstream extra;
+    extra << grid.str();
+    extra << makeSvgPolyline(pts, "#ff8c00", 2.5f);
+    extra << "<circle cx='" << cpx << "' cy='" << cpy << "' r='7'"
+          << " fill='#dc3232' stroke='white' stroke-width='1.5'/>";
+    extra << "<text x='" << (cpx + 10) << "' y='" << (cpy - 8) << "'"
+          << " font-size='10' fill='#dc3232' font-family='monospace'>(-1, 0)</text>";
+    extra << "<text x='" << (W / 2) << "' y='" << (H - 4) << "'"
+          << " font-size='10' fill='#888' text-anchor='middle' font-family='monospace'>Re →</text>";
+    extra << "<text x='" << (pad - 4) << "' y='" << (plotTop + 14) << "'"
+          << " font-size='10' fill='#888' text-anchor='end' font-family='monospace'>↑jIm</text>";
+    return svgFrame(extra.str(), "NYQUIST  (0.1 Hz – 10 MHz, log sweep)", W, H);
+}
+
+// Build Step Response SVG — fixed coordinate mapping, larger, with NaN guard
+static std::string buildStepSvg(const StepData& sd, int W = 760, int H = 280)
+{
+    if (!sd.valid || sd.time.empty()) return svgFrame("", "STEP RESPONSE", W, H);
+    int pad = 52;
+    double tmax = sd.time.back();
+    if (tmax <= 0 || !std::isfinite(tmax)) return svgFrame("", "STEP RESPONSE (bad data)", W, H);
+
+    // Filter NaN/Inf before computing range
+    double mn = std::numeric_limits<double>::max();
+    double mx = -std::numeric_limits<double>::max();
+    for (double v : sd.value) {
+        if (std::isfinite(v)) { mn = std::min(mn, v); mx = std::max(mx, v); }
+    }
+    if (mn > mx) { mn = 0; mx = 1; }  // all values were bad
+    double pad_v = std::max(std::abs(mx - mn) * 0.12, 0.05);
+    mn -= pad_v; mx += pad_v;
+
+    int plotTop = SVG_TOP;
+    int plotBot = H - SVG_PBOT;
+    float plotW = W - 2.f * pad;
+    float plotHpx = static_cast<float>(plotBot - plotTop);
+
+    // Time grid
+    std::ostringstream tgrid;
+    int nT = 8;
+    for (int i = 0; i <= nT; ++i) {
+        double tv = tmax * i / nT;
+        float px = pad + static_cast<float>(i) / nT * plotW;
+        tgrid << "<line x1='" << px << "' y1='" << plotTop << "' x2='" << px
+              << "' y2='" << plotBot << "' stroke='" << (i == 0 ? "#555" : "#2e2e2e")
+              << "' stroke-width='" << (i == 0 ? "1.2" : "0.7") << "'/>";
+        std::ostringstream lbl;
+        if (tv < 1e-9)       lbl << std::scientific << std::setprecision(1) << tv << "s";
+        else if (tv < 1e-6)  lbl << std::fixed << std::setprecision(1) << tv * 1e9 << "ns";
+        else if (tv < 1e-3)  lbl << std::fixed << std::setprecision(1) << tv * 1e6 << "us";
+        else if (tv < 1.0)   lbl << std::fixed << std::setprecision(1) << tv * 1e3 << "ms";
+        else                  lbl << std::fixed << std::setprecision(3) << tv << "s";
+        tgrid << "<text x='" << px << "' y='" << (H - 4) << "'"
+              << " font-size='9' fill='#777' text-anchor='middle' font-family='monospace'>"
+              << lbl.str() << "</text>";
+    }
+
+    std::vector<std::pair<float,float>> pts;
+    pts.reserve(sd.time.size());
+    for (size_t i = 0; i < sd.time.size(); ++i) {
+        if (!std::isfinite(sd.value[i]) || !std::isfinite(sd.time[i])) continue;
+        float px = pad + static_cast<float>(sd.time[i] / tmax) * plotW;
+        float py = svgValToPy(sd.value[i], mn, mx, H);
+        py = std::clamp(py, (float)plotTop, (float)plotBot);
+        pts.push_back({px, py});
+    }
+
+    // Draw a DC steady-state reference line (y=1 for LP/HP, y=0 for BP)
+    float refY = svgValToPy(1.0, mn, mx, H);
+    std::string refLine;
+    if (refY >= plotTop && refY <= plotBot) {
+        std::ostringstream rl;
+        rl << "<line x1='" << pad << "' y1='" << refY << "' x2='" << (W - pad)
+           << "' y2='" << refY << "' stroke='#3c8' stroke-width='0.8' stroke-dasharray='5,5'/>";
+        rl << "<text x='" << (W - pad + 2) << "' y='" << (refY + 4)
+           << "' font-size='9' fill='#3c8' font-family='monospace'>1.0</text>";
+        refLine = rl.str();
+    }
+
+    std::string inner = tgrid.str()
+                      + svgHGrid(mn, mx, W, H, pad)
+                      + refLine
+                      + makeSvgPolyline(pts, "#3cc878", 2.5f);
+    inner += "<text x='" + std::to_string(pad - 4) + "' y='22'"
+             " font-size='10' fill='#aaa' text-anchor='end' font-family='monospace'>amp</text>";
+    inner += "<text x='" + std::to_string(W / 2) + "' y='" + std::to_string(H - 4) + "'"
+             " font-size='10' fill='#888' text-anchor='middle' font-family='monospace'>Time</text>";
+    return svgFrame(inner, "STEP RESPONSE", W, H);
+}
+
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GENERATE PROFESSIONAL HTML REPORT
+// ─────────────────────────────────────────────────────────────────────────────
+void generateProfessionalReport(const BodeData& d,
+                                 const NyquistData& ny,
+                                 const StepData& sd,
+                                 const StabilityAnalyzer::Result& st,
+                                 const std::vector<double>& tfNum,
+                                 const std::vector<double>& tfDen,
+                                 const TraceManager& traces,
+                                 const std::string& outPath)
+{
+    // Timestamp
+    std::time_t now = std::time(nullptr);
+    char tsBuf[64];
+    std::strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%d  %H:%M:%S", std::localtime(&now));
+
+    // TF strings
+    auto polyStr = [](const std::vector<double>& c) -> std::string {
+        if (c.empty()) return "?";
+        std::ostringstream o;
+        int n = static_cast<int>(c.size()) - 1;
+        bool first = true;
+        for (int i = 0; i <= n; ++i) {
+            double v = c[i]; int e = n - i;
+            if (std::abs(v) < 1e-15) continue;
+            if (!first) { if (v > 0) o << " + "; else { o << " &minus; "; v = -v; } }
+            if (std::abs(v - 1.0) > 1e-9 || e == 0) {
+                if (v >= 1e5 || (v < 0.01 && v > 1e-12))
+                    o << std::scientific << std::setprecision(3) << v;
+                else
+                    o << std::fixed << std::setprecision(3) << v;
+            }
+            if (e > 0) o << "s";
+            if (e > 1) o << "<sup>" << e << "</sup>";
+            first = false;
+        }
+        std::string r = o.str();
+        return r.empty() ? "0" : r;
+    };
+
+    std::string ns = polyStr(tfNum);
+    std::string ds = polyStr(tfDen);
+
+    // Stability verdict
+    std::string verdict  = "N/A";
+    std::string vColor   = "#888";
+    if (st.valid) {
+        verdict = st.stable ? "STABLE" : "UNSTABLE";
+        if (st.rhpPole) verdict = "UNSTABLE &mdash; RHP Pole";
+        vColor  = st.stable ? "#3cc878" : "#eb5050";
+    }
+
+    // Poles/zeros table rows
+    auto cpxRow = [](const std::string& type, const std::complex<double>& c) -> std::string {
+        std::ostringstream o;
+        o << "<tr><td>" << type << "</td><td>" << std::fixed << std::setprecision(4)
+          << c.real() << "</td><td>" << c.imag() << "j</td><td>"
+          << (c.real() > 1e-9 ? "<span style='color:#eb5050'>RHP</span>" : "LHP")
+          << "</td></tr>";
+        return o.str();
+    };
+
+    std::string pzRows;
+    for (auto& p : st.poles) pzRows += cpxRow("Pole", p);
+    for (auto& z : st.zeros) pzRows += cpxRow("Zero", z);
+
+    // Crossover info
+    std::ostringstream fcRow, fgcRow, pmRow, fpiRow, gmRow;
+    if (st.hasFc) {
+        std::ostringstream fl; fl << std::fixed << std::setprecision(2) << st.fcHz << " Hz";
+        fcRow << "<tr><td>Bandwidth &minus;3dB (f<sub>c</sub>)</td><td>" << fl.str() << "</td></tr>";
+    }
+    if (st.hasFgc) {
+        std::ostringstream fl; fl << std::fixed << std::setprecision(2) << st.fgcHz << " Hz";
+        fgcRow << "<tr><td>Gain Crossover (f<sub>gc</sub>)</td><td>" << fl.str() << "</td></tr>";
+        pmRow << "<tr><td>Phase Margin (PM)</td><td style='color:"
+              << (st.pmStable ? "#3cc878" : "#eb5050") << "'>"
+              << std::fixed << std::setprecision(2) << st.pmDeg << " deg</td></tr>";
+    } else {
+        pmRow << "<tr><td>Phase Margin (PM)</td><td style='color:#3cc878'>∞ (no 0 dB crossing)</td></tr>";
+    }
+    if (st.hasFpi) {
+        std::ostringstream fl; fl << std::fixed << std::setprecision(2) << st.fpiHz << " Hz";
+        fpiRow << "<tr><td>Phase-Crossover (f<sub>&pi;</sub>)</td><td>" << fl.str() << "</td></tr>";
+        gmRow  << "<tr><td>Gain Margin (GM)</td><td style='color:"
+               << (st.gmStable ? "#3cc878" : "#eb5050") << "'>"
+               << std::fixed << std::setprecision(2) << st.gmDb << " dB</td></tr>";
+    } else {
+        gmRow  << "<tr><td>Gain Margin (GM)</td><td style='color:#3cc878'>∞ (no −180° crossing)</td></tr>";
+    }
+
+    // SVG plots — pass ghost data to mag and phase builders
+    std::string svgMag   = buildMagSvg(d,
+                                       traces.ghostFreq, traces.ghostMagRaw,
+                                       traces.ghostScale, traces.hasGhost);
+    std::string svgPhase = buildPhaseSvg(d,
+                                         traces.ghostFreq, traces.ghostPhaseRaw,
+                                         traces.ghostScale, traces.hasGhost);
+    std::string svgNy    = buildNyquistSvg(ny);
+    std::string svgStep  = buildStepSvg(sd);
+
+    // ── HTML template ─────────────────────────────────────────────────────────
+    std::ofstream f(outPath);
+    if (!f) return;
+    f << R"(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>BodePlot Pro — System Analysis Report</title>
+<style>
+  *{box-sizing:border-box}
+  body{font-family:Consolas,monospace;background:#0f0f12;color:#d0d0d8;
+       margin:0;padding:32px 40px;max-width:1700px;margin:auto}
+  h1{color:#ff8c00;font-size:24px;margin-bottom:4px;letter-spacing:1px}
+  .ts{color:#555;font-size:12px;margin-bottom:28px}
+  h2{color:#ff8c00;font-size:15px;border-bottom:1px solid #2a2a2a;
+     padding-bottom:6px;margin-top:32px;letter-spacing:.5px}
+  .tf-box{background:#1a1a22;border:1px solid #333;border-radius:6px;
+          padding:18px 28px;display:inline-block;text-align:center;min-width:280px}
+  .tf-num{color:#fff;font-size:17px;border-bottom:2px solid #ff8c00;
+          padding-bottom:8px;margin-bottom:8px}
+  .tf-den{color:#fff;font-size:17px}
+  .tf-label{color:#666;font-size:11px;margin-bottom:6px}
+  table{border-collapse:collapse;width:100%;max-width:700px;margin-top:10px}
+  th{background:#1a1a22;color:#ff8c00;padding:7px 14px;text-align:left;font-size:12px}
+  td{padding:6px 14px;font-size:13px;border-bottom:1px solid #1a1a22}
+  tr:hover td{background:#161620}
+  .verdict{font-size:22px;font-weight:bold;padding:10px 0}
+  /* Plots in a single column for full width */
+  .plots{display:flex;flex-direction:column;gap:20px;margin-top:12px}
+  .plot-wrap{background:#0d0d10;border:1px solid #1e1e28;border-radius:6px;
+             padding:12px 16px}
+  .plot-label{color:#666;font-size:11px;text-align:center;margin-top:6px;
+              font-style:italic}
+  .footer{color:#333;font-size:11px;margin-top:40px;border-top:1px solid #1a1a1a;
+          padding-top:10px}
+  @media print{
+    body{background:#fff;color:#000;padding:16px}
+    h1,h2{color:#b05000}
+    .verdict{color:inherit}
+    th{background:#eee;color:#b05000}
+    .plot-wrap{border:1px solid #ccc}
+    svg{background:#fff !important;border-color:#ccc !important}
+  }
+</style>
+</head>
+<body>
+<h1>&#9654; BodePlot Pro &mdash; System Analysis Report</h1>
+<div class="ts">Generated: )";
+    f << tsBuf;
+    f << R"(</div>
+
+<h2>&#167;1 &mdash; Transfer Function</h2>
+<div class="tf-box">
+  <div class="tf-label">H(s) =</div>
+  <div class="tf-num">)" << ns << R"(</div>
+  <div class="tf-den">)" << ds << R"(</div>
+</div>
+
+<h2>&#167;2 &mdash; Stability Analysis</h2>
+<div class="verdict" style="color:)" << vColor << R"(">)" << verdict << R"(</div>
+<table>
+<tr><th>Parameter</th><th>Value</th></tr>
+)" << fcRow.str() << fgcRow.str() << pmRow.str() << fpiRow.str() << gmRow.str() << R"(</table>
+
+<h3 style="color:#888;font-size:13px;margin-top:18px">Pole / Zero Locations</h3>
+<table>
+<tr><th>Type</th><th>Real</th><th>Imaginary</th><th>Half-plane</th></tr>
+)" << pzRows << R"(</table>
+
+<h2>&#167;3 &mdash; Frequency &amp; Time Domain Plots</h2>
+<div class="plots">
+  <div class="plot-wrap">)" << svgMag   << R"(<div class="plot-label">Magnitude Response — dB vs Frequency</div></div>
+  <div class="plot-wrap">)" << svgPhase << R"(<div class="plot-label">Phase Response — degrees vs Frequency)</div></div>
+  <div class="plot-wrap">)" << svgNy    << R"(<div class="plot-label">Nyquist Plot — red dot marks the critical point (−1, 0j)</div></div>
+  <div class="plot-wrap">)" << svgStep  << R"(<div class="plot-label">Step Response — amplitude vs time (adaptive sub-step ODE)</div></div>
+</div>
+
+<div class="footer">BodePlot Pro v1.0 &mdash; Control Systems Lab &mdash; SFML 3.0 / C++17
+<br>To save as PDF: File &rarr; Print &rarr; Save as PDF (set margins to None)</div>
+</body></html>
+)";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  EXPORT CSV  — uses strict nomenclature: fcHz, fpiHz, pmDeg, gmDb
+//  Also triggers generateProfessionalReport() simultaneously
+// ─────────────────────────────────────────────────────────────────────────────
+void exportCSV(const BodeData& d,
+               const NyquistData& ny,
+               const StepData& sd,
+               const StabilityAnalyzer::Result& st,
+               const std::vector<double>& tfNum,
+               const std::vector<double>& tfDen,
+               const TraceManager& traces,
+               std::string& statusMsg)
+{
+    std::string dlPath = getDownloadsPath();
+    std::string csvPath  = dlPath + "bodeplot_pro_data.csv";
+    std::string htmlPath = dlPath + "bodeplot_pro_report.html";
+
+    // ── CSV ───────────────────────────────────────────────────────────────────
+    std::ofstream f(csvPath);
+    if (!f) {
+        // Fallback to current directory
+        csvPath  = "bodeplot_pro_data.csv";
+        htmlPath = "bodeplot_pro_report.html";
+        f.open(csvPath);
+    }
+    if (f) {
+        f << "Frequency(Hz),Magnitude(dB),Phase(deg),Fc(Hz),PM(deg),Fpi(Hz),GM(dB),Stable\n"
+          << std::fixed << std::setprecision(6);
+        double fcHz  = st.hasFc  ? (st.fcHz * 10.0)  : std::numeric_limits<double>::quiet_NaN();
+        double pmDeg = st.hasFc  ? st.pmDeg : std::numeric_limits<double>::quiet_NaN();
+        double fpiHz = st.hasFpi ? (st.fpiHz * 10.0) : std::numeric_limits<double>::quiet_NaN();
+        double gmDb  = st.hasFpi ? st.gmDb  : std::numeric_limits<double>::quiet_NaN();
+        int stable   = st.valid  ? (st.stable ? 1 : 0) : -1;
+        for (size_t i = 0; i < d.freq.size(); ++i){
+            double correctedFreq = d.freq[i] * 10.0;
+            f << correctedFreq << ',' << d.mag[i] << ',' << d.phase[i] << ','
+              << fcHz << ',' << pmDeg << ',' << fpiHz << ',' << gmDb << ','
+              << stable << '\n';
+            }
+        f.close();
+    }
+
+    // ── HTML Report ───────────────────────────────────────────────────────────
+    generateProfessionalReport(d, ny, sd, st, tfNum, tfDen, traces, htmlPath);
+
+    statusMsg = "Saved -> " + csvPath + " + HTML report";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  COORDINATE HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+// LOG_MIN_FREQ = log10(0.01) = -2.0 is defined near the top of the file
+
+float  freqToX(double f, float gx, float gw, double logMaxFreq)
+{
+    // Map [0.01 Hz .. maxFreq] -> [gx .. gx+gw]
+    double t = (std::log10(f) - LOG_MIN_FREQ) / (logMaxFreq - LOG_MIN_FREQ);
+    return gx + static_cast<float>(std::clamp(t, 0.0, 1.0)) * gw;
+}
+double xToFreq(float px, float gx, float gw, double logMaxFreq)
+{
+    double t = static_cast<double>(px - gx) / gw;
+    return std::pow(10.0, LOG_MIN_FREQ + t * (logMaxFreq - LOG_MIN_FREQ));
+}
+float valToY(double v, double vmin, double vmax, float gy, float gh)
+{
+    double t = (vmax - v) / (vmax - vmin);
+    return gy + static_cast<float>(t) * gh;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  DRAW HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+void drawRect(sf::RenderWindow& win, float x, float y, float W, float H,
+              sf::Color fill,
+              sf::Color outline = sf::Color::Transparent, float thick = 0.f)
+{
+    sf::RectangleShape r{{W, H}};
+    r.setPosition({x, y});
+    r.setFillColor(fill);
+    if (thick > 0.f) { r.setOutlineThickness(-thick); r.setOutlineColor(outline); }
+    win.draw(r);
+}
+
+void drawLine(sf::RenderWindow& win,
+              float x1, float y1, float x2, float y2, sf::Color c)
+{
+    sf::Vertex v[2] = {sf::Vertex{{x1,y1},c}, sf::Vertex{{x2,y2},c}};
+    win.draw(v, 2, sf::PrimitiveType::Lines);
+}
+
+void drawText(sf::RenderWindow& win, sf::Font& fnt,
+              const std::string& s, float x, float y,
+              unsigned sz, sf::Color c, bool centerX = false)
+{
+    sf::Text t(fnt, s, sz);
+    t.setFillColor(c);
+    if (centerX) {
+        auto b = t.getLocalBounds();
+        t.setOrigin({b.position.x + b.size.x * 0.5f, 0.f});
+    }
+    t.setPosition({x, y});
+    win.draw(t);
+}
+
+std::string polyToStr(const std::vector<double>& c)
+{
+    if (c.empty()) return "?";
+    std::ostringstream o;
+    int n = static_cast<int>(c.size()) - 1;
+    bool first = true;
+    for (int i = 0; i <= n; ++i) {
+        double v = c[i]; int e = n - i;
+        if (std::abs(v) < 1e-15) continue;
+        if (!first) { if (v > 0) o << " + "; else { o << " - "; v = -v; } }
+        bool showCoef = (std::abs(v - 1.0) > 1e-9) || (e == 0);
+        if (showCoef) {
+            if (v >= 1e5 || (v < 0.01 && v > 1e-12))
+                o << std::scientific << std::setprecision(2) << v;
+            else {
+                double intpart;
+                int dp = (std::modf(v, &intpart) == 0.0) ? 0 : 2;
+                o << std::fixed << std::setprecision(dp) << v;
+            }
+        }
+        if (e > 0) o << 's';
+        if (e > 1) o << '^' << e;
+        first = false;
+    }
+    std::string r = o.str();
+    return r.empty() ? "0" : r;
+}
+
+std::string freqLabel(double f)
+{
+    std::ostringstream o;
+    if      (f >= 1e9)  o << std::fixed << std::setprecision(2) << f/1e9  << "GHz";
+    else if (f >= 1e6)  o << std::fixed << std::setprecision(2) << f/1e6  << "MHz";
+    else if (f >= 1e3)  o << std::fixed << std::setprecision(1) << f/1e3  << "kHz";
+    else                o << std::fixed << std::setprecision(1) << f      << "Hz";
+    return o.str();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  S-PLANE WIDGET
+//  — Poles drawn as 'X'  (Red if real()>0, Accent otherwise)
+//  — Zeros drawn as 'O'  (blue outline circles)
+// ─────────────────────────────────────────────────────────────────────────────
+void drawSPlane(sf::RenderWindow& win, sf::Font& font, bool fontOk,
+                const StabilityAnalyzer::Result& stab,
+                float cx, float cy, float sz)
+{
+    // Background + border
+    drawRect(win, cx, cy, sz, sz, T.in_bg, T.border, 1.f);
+    // Axes
+    float midX = cx + sz * 0.5f;
+    float midY = cy + sz * 0.5f;
+    drawLine(win, cx, midY, cx+sz, midY, T.grid_mn);
+    drawLine(win, midX, cy, midX, cy+sz, T.grid_mn);
+
+    // RHP shading
+    drawRect(win, midX, cy, sz*0.5f, sz, {235,80,80,18});
+
+    // Auto-scale
+    double maxVal = 1.0;
+    for (auto& p : stab.poles)
+        maxVal = std::max(maxVal, std::max(std::abs(p.real()), std::abs(p.imag())));
+    for (auto& z : stab.zeros)
+        maxVal = std::max(maxVal, std::max(std::abs(z.real()), std::abs(z.imag())));
+    maxVal *= 1.3;
+
+    auto toScreen = [&](std::complex<double> c) -> sf::Vector2f {
+        float sx = midX + static_cast<float>(c.real() / maxVal) * sz * 0.45f;
+        float sy = midY - static_cast<float>(c.imag() / maxVal) * sz * 0.45f;
+        return {sx, sy};
+    };
+
+    // Draw poles (X)
+    for (auto& p : stab.poles) {
+        auto sc = toScreen(p);
+        // RED for RHP poles (real > 0), Accent for LHP
+        sf::Color col = (p.real() > 1e-9) ? T.bad : T.accent;
+        float d = std::min(6.f, sz * 0.06f);
+        drawLine(win, sc.x-d, sc.y-d, sc.x+d, sc.y+d, col);
+        drawLine(win, sc.x+d, sc.y-d, sc.x-d, sc.y+d, col);
+    }
+    // Draw zeros (O)
+    for (auto& z : stab.zeros) {
+        auto sc = toScreen(z);
+        float r = std::min(5.f, sz * 0.05f);
+        sf::CircleShape ci(r);
+        ci.setFillColor(sf::Color::Transparent);
+        ci.setOutlineColor({130, 180, 255});
+        ci.setOutlineThickness(1.5f);
+        ci.setOrigin({r, r});
+        ci.setPosition(sc);
+        win.draw(ci);
+    }
+
+    if (fontOk) {
+        drawText(win, font, "S-PLANE", midX, cy + 3.f, 10, T.text_lo, true);
+        drawText(win, font, "X=Poles  O=Zeros", cx + 3.f, cy + sz - 14.f, 9, T.text_lo);
+        // Axis labels
+        drawText(win, font, "jw", midX + 2.f, cy + 2.f,     8, {80,80,120});
+        drawText(win, font, "s",  cx + sz - 10.f, midY - 14.f, 8, {80,80,120});
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  CIRCUIT MODE  —  Adaptive: second-order RLC if L>0, first-order RC if L=0
+// ─────────────────────────────────────────────────────────────────────────────
+//enum class CircuitType { LowPass, HighPass, BandPass };
+
+struct CircuitCoeffs {
+    std::vector<double> num, den;
+    std::string bandPassMsg; // non-empty => display message instead
+};
+
+CircuitCoeffs circuitCoeffs(double R, double L, double C, CircuitType ct)
+{
+    CircuitCoeffs cc;
+    const bool hasL = (L > 1e-15);
+    const double RC = R * C;
+    const double LC = L * C;
+
+    if (hasL) {
+        // --- Second-Order RLC (s^2 + s + 1) ---
+        cc.den = {LC, RC, 1.0}; 
+        switch (ct) {
+            case CircuitType::LowPass:
+                cc.num = {0.0, 0.0, 1.0}; // Correct: 0s^2 + 0s + 1
+                break;
+            case CircuitType::HighPass:
+                cc.num = {LC, 0.0, 0.0};  // Correct: LCs^2 + 0s + 0
+                break;
+            case CircuitType::BandPass:
+                cc.num = {0.0, RC, 0.0};  // Correct: 0s^2 + RCs + 0
+                break;
+        }
+    } else {
+        // --- First-Order RC (s + 1) ---
+        cc.den = {RC, 1.0};
+        switch (ct) {
+            case CircuitType::LowPass:
+                cc.num = {0.0, 1.0};      // Correct: 0s + 1
+                break;
+            case CircuitType::HighPass:
+                cc.num = {RC, 0.0};      // Correct: RCs + 0
+                break;
+            case CircuitType::BandPass:
+                cc.bandPassMsg = "L=0: Circuit behaves as RC Low-Pass";
+                cc.num = {0.0, 1.0}; 
+                cc.den = {RC, 1.0};
+                break;
+        }
+    }
+    return cc;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SLIDER WIDGET  — linear scale with auto-centering support
+// ─────────────────────────────────────────────────────────────────────────────
+struct Slider {
+    float x, y, w, h;
+    double vmin, vmax, value;
+    std::string label;
+    bool dragging = false;
+
+    float thumbX() const {
+        if (std::abs(vmax - vmin) < 1e-300) return x;
+        double t = (value - vmin) / (vmax - vmin);
+        return x + static_cast<float>(std::clamp(t, 0.0, 1.0)) * w;
+    }
+    bool hitThumb(float px, float py) const {
+        float tx = thumbX();
+        return px >= tx-10.f && px <= tx+10.f && py >= y-8.f && py <= y+h+8.f;
+    }
+    bool hitTrack(float px, float py) const {
+        return px >= x && px <= x+w && py >= y-8.f && py <= y+h+8.f;
+    }
+    void setFromX(float px) {
+        float t = std::clamp((px - x) / w, 0.f, 1.f);
+        value = vmin + t * (vmax - vmin);
+        value = std::clamp(value, vmin, vmax);
+    }
+    // Auto-center: entered value becomes midpoint, range = 0 to 2×value
+    void recalibrate(double center) {
+        if (center > 0.0) {
+            vmin  = 0.0;
+            vmax  = center * 2.0;
+            value = center;
+        } else if (center < 0.0) {
+            vmin  = center * 2.0;
+            vmax  = 0.0;
+            value = center;
+        } else {
+            // zero entered: keep range but snap to min
+            value = vmin;
+        }
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  BUTTON WIDGET
+// ─────────────────────────────────────────────────────────────────────────────
+struct Btn {
+    float x, y, w, h;
+    std::string label;
+    bool hov = false;
+    bool hit(float px, float py) const { return px>=x&&px<x+w&&py>=y&&py<y+h; }
+};
+
+struct IBox {
+    float x, y, w, h;
+    std::string* text;
+    std::string  label, hint;
+    bool hit(float px, float py) const { return px>=x&&px<x+w&&py>=y&&py<y+h; }
+};
+
+void drawBtn(sf::RenderWindow& win, sf::Font& font, const Btn& btn,
+             sf::Color accentCol)
+{
+    sf::Color bg = btn.hov ? accentCol : T.in_bg;
+    sf::Color tc = btn.hov ? T.bg      : accentCol;
+    sf::Color br = btn.hov ? accentCol : T.border;
+    drawRect(win, btn.x, btn.y, btn.w, btn.h, bg, br, 1.5f);
+    drawText(win, font, btn.label,
+             btn.x + btn.w*0.5f, btn.y + btn.h*0.5f - 8.f, 13, tc, true);
+}
+
+void drawSlider(sf::RenderWindow& win, sf::Font& font,
+                const Slider& sl, bool fontOk, bool grayed = false)
+{
+    sf::Color trackCol  = grayed ? sf::Color{50,50,50}   : T.border;
+    sf::Color fillCol   = grayed ? sf::Color{60,60,60}   : T.accent;
+    sf::Color thumbCol  = grayed ? sf::Color{70,70,70}   : T.accent;
+    sf::Color textCol   = grayed ? sf::Color{70,70,70}   : T.text_lo;
+    sf::Color valCol    = grayed ? sf::Color{70,70,70}   : T.accent;
+
+    drawRect(win, sl.x, sl.y + sl.h*0.5f - 2.f, sl.w, 4.f, trackCol);
+    if (!grayed) {
+        float tx = sl.thumbX();
+        drawRect(win, sl.x, sl.y + sl.h*0.5f - 2.f, tx - sl.x, 4.f, fillCol);
+    }
+    sf::CircleShape th(9.f);
+    th.setFillColor(thumbCol);
+    th.setOutlineColor(grayed ? sf::Color{40,40,40} : T.bg);
+    th.setOutlineThickness(2.f);
+    th.setOrigin({9.f, 9.f});
+    th.setPosition({sl.thumbX(), sl.y + sl.h*0.5f});
+    win.draw(th);
+
+    if (fontOk) {
+        // Format helper
+        auto fmtVal = [](double v) -> std::string {
+            std::ostringstream ov;
+            double av = std::abs(v);
+            if      (av >= 1e6)  ov << std::fixed << std::setprecision(2) << v/1e6  << "M";
+            else if (av >= 1e3)  ov << std::fixed << std::setprecision(2) << v/1e3  << "k";
+            else if (av >= 1.0)  ov << std::fixed << std::setprecision(3) << v;
+            else if (av >= 1e-3) ov << std::fixed << std::setprecision(4) << v;
+            else                 ov << std::scientific << std::setprecision(2) << v;
+            return ov.str();
+        };
+        // Label above-left of slider
+        drawText(win, font, sl.label, sl.x, sl.y - 18.f, 11, textCol);
+        // Value centered below the thumb (moves with slider position)
+        float thumbPx = sl.thumbX();
+        float valY    = sl.y + sl.h * 0.5f + 12.f;  // just below the track
+        drawText(win, font, fmtVal(sl.value), thumbPx, valY, 9,
+                 grayed ? sf::Color{70,70,70} : sf::Color{180,160,100}, true);
+        // Range endpoints at track edges (small, subdued)
+        drawText(win, font, fmtVal(sl.vmin), sl.x,
+                 sl.y + sl.h*0.5f + 12.f, 7,
+                 grayed ? sf::Color{45,45,45} : T.grid_mn);
+        drawText(win, font, fmtVal(sl.vmax), sl.x + sl.w,
+                 sl.y + sl.h*0.5f + 12.f, 7,
+                 grayed ? sf::Color{45,45,45} : T.grid_mn, true);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WELCOME SCREEN
+//  States:
+//    0 = fading in  (0 -> 255, over 2 sec)
+//    1 = pulsing    (2 sec onward, subtle scale)
+//    2 = fading out (triggered by keypress or 3-sec timer)
+// ─────────────────────────────────────────────────────────────────────────────
+struct WelcomeScreen {
+    sf::Clock clock;
+    int  phase      = 0;     // 0=fade-in, 1=pulse, 2=fade-out
+    bool done       = false;
+    float fadeOut   = 1.f;   // multiplier 1 -> 0 during fade-out
+
+    void triggerExit() {
+        if (phase < 2) phase = 2;
+    }
+
+    // Returns current alpha (0-255) for the whole screen
+    uint8_t alpha(float elapsed) const {
+        if (phase == 0) {
+            // Fade in over 2 seconds
+            float t = std::clamp(elapsed / 2.0f, 0.f, 1.f);
+            return static_cast<uint8_t>(t * 255.f);
+        } else if (phase == 1) {
+            return 255u;
+        } else {
+            // Fade out over 0.5 sec
+            return static_cast<uint8_t>(std::clamp(fadeOut, 0.f, 1.f) * 255.f);
+        }
+    }
+
+    // Returns a scale factor for the pulse (phase 1 only)
+    float scale(float elapsed) const {
+        if (phase != 1) return 1.0f;
+        float t = elapsed - 2.0f;                         // seconds since pulse started
+        return 1.0f + 0.012f * std::sin(t * 2.0f * (float)M_PI * 0.9f);
+    }
+
+    // Call every frame; returns true when the screen should be dismissed
+    bool update() {
+        float elapsed = clock.getElapsedTime().asSeconds();
+        if (phase == 0 && elapsed >= 2.0f) phase = 1;
+        // Auto-dismiss after 3 seconds total
+        if (phase == 1 && elapsed >= 3.0f) triggerExit();
+        if (phase == 2) {
+            // Shrink fadeOut from 1 to 0 over 0.5 sec
+            fadeOut = std::max(0.f, fadeOut - (1.f / (0.5f * 60.f)));
+            if (fadeOut <= 0.f) done = true;
+        }
+        return done;
+    }
+
+    void draw(sf::RenderWindow& win, sf::Font& font, bool fontOk, float WIN_W, float WIN_H)
+    {
+        float elapsed = clock.getElapsedTime().asSeconds();
+        uint8_t a     = alpha(elapsed);
+        float   sc    = scale(elapsed);
+
+        // Dim background
+        drawRect(win, 0.f, 0.f, WIN_W, WIN_H, {10, 10, 14, a});
+
+        if (!fontOk) return;
+
+        float cx = WIN_W * 0.5f;
+        float cy = WIN_H * 0.5f;
+
+        // ── Draw a glowing box ────────────────────────────────────────────
+        float bw = 520.f * sc, bh = 240.f * sc;
+        float bx = cx - bw*0.5f, by = cy - bh*0.5f;
+        sf::Color box_fill{20, 20, 30, (uint8_t)(a * 0.85f)};
+        sf::Color box_border{T.accent.r, T.accent.g, T.accent.b, a};
+        drawRect(win, bx, by, bw, bh, box_fill, box_border, 2.5f);
+
+        // Decorative inner separator
+        drawLine(win, bx + 30.f, cy - 10.f * sc, bx + bw - 30.f, cy - 10.f * sc,
+                 {T.accent.r, T.accent.g, T.accent.b, (uint8_t)(a * 0.35f)});
+
+        // App title — large
+        sf::Text title(font, "BodePlot Pro", static_cast<unsigned>(36 * sc));
+        title.setFillColor({T.accent.r, T.accent.g, T.accent.b, a});
+        title.setStyle(sf::Text::Bold);
+        auto tb = title.getLocalBounds();
+        title.setOrigin({tb.position.x + tb.size.x * 0.5f,
+                         tb.position.y + tb.size.y * 0.5f});
+        title.setPosition({cx, cy - bh * 0.22f});
+        win.draw(title);
+
+        // Subtitle
+        sf::Text sub(font, "Universal Transfer Function Analyzer", static_cast<unsigned>(15 * sc));
+        sub.setFillColor({200, 200, 220, a});
+        auto sb = sub.getLocalBounds();
+        sub.setOrigin({sb.position.x + sb.size.x * 0.5f, 0.f});
+        sub.setPosition({cx, cy + 10.f * sc});
+        win.draw(sub);
+
+        // Author line
+        sf::Text auth(font, "Control Systems Lab  |  SFML 3.0", static_cast<unsigned>(11 * sc));
+        auth.setFillColor({110, 120, 140, (uint8_t)(a * 0.85f)});
+        auto ab = auth.getLocalBounds();
+        auth.setOrigin({ab.position.x + ab.size.x * 0.5f, 0.f});
+        auth.setPosition({cx, cy + bh * 0.28f});
+        win.draw(auth);
+
+        // Hint (only after fade-in complete)
+        if (phase >= 1) {
+            uint8_t ha = static_cast<uint8_t>(a * std::abs(std::sin(elapsed * 2.5f)));
+            sf::Text hint(font, "Press any key to continue...", 12u);
+            hint.setFillColor({180, 180, 180, ha});
+            auto hb = hint.getLocalBounds();
+            hint.setOrigin({hb.position.x + hb.size.x * 0.5f, 0.f});
+            hint.setPosition({cx, cy + bh * 0.5f + 28.f});
+            win.draw(hint);
+        }
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  MAIN
+// ─────────────────────────────────────────────────────────────────────────────
+int main()
+{
+    sf::RenderWindow window(sf::VideoMode({1300u, 860u}),
+                            "BodePlot Pro — Universal Transfer Function Analyzer");
+    window.setFramerateLimit(60);
+
+    // ── Font ──────────────────────────────────────────────────────────────────
+    sf::Font font;
+    bool fontOk = false;
+    const char* fPaths[] = {
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/calibri.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/consola.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/Library/Fonts/Helvetica.ttf"
+    };
+    for (auto& p : fPaths) if (font.openFromFile(p)) { fontOk = true; break; }
+
+    // ── App state ─────────────────────────────────────────────────────────────
+    AppState appState = AppState::WELCOME;
+    WelcomeScreen welcome;
+
+    std::string numStr     = "39478417";
+    std::string denStr     = "1, 6283, 39478417";
+    std::string maxFreqStr = "1000000";
+    int      activeBox     = -1;
+    bool     needsReplot   = true;
+    bool     darkTheme     = true;
+    bool     circuitMode   = false;
+    CircuitType circType   = CircuitType::LowPass;
+
+    BodeData bode;
+    StepData step;
+    NyquistData nyquist;
+    StabilityAnalyzer::Result stab;
+    TraceManager traces;
+    double magMin = -80, magMax = 40;
+    double phMin  = -200, phMax = 50;
+    double maxFreq = 1e6;
+    std::string statusMsg  = "Ready.";
+
+    // Lower panel view: 0=Phase, 1=Nyquist, 2=Step Response
+    int lowerPanelView = 0;
+    std::string stepMaxTimeStr = "";   // empty = auto
+
+    Slider slR{0,0,0,20, 0.0,    2000.0, 1000.0, "R (Ohms)"};
+    Slider slL{0,0,0,20, 0.0,    0.002,  0.001,  "L (H)"};
+    Slider slC{0,0,0,20, 0.0,    2e-6,   1e-6,   "C (F)"};
+    Slider* draggingSlider = nullptr;
+
+    // ── Enable-L toggle state ─────────────────────────────────────────────────
+    bool inductorActive = true;   // true=Green(RLC), false=Red(RC)
+
+    // R/L/C precision text input fields (bi-directional sync with sliders)
+    std::string rStr = "1000";
+    std::string lStr = "0.001";
+    std::string cStr = "1e-06";
+    int activeRLCBox = -1; // 0=R, 1=L, 2=C
+
+    // Nyquist pan state (mouse drag to move the plot)
+    double nyqPanX = 0.0, nyqPanY = 0.0;   // pan offset in data units
+    bool   nyqDragging = false;
+    sf::Vector2f nyqDragStart{0.f, 0.f};
+    double nyqDragPanX0 = 0.0, nyqDragPanY0 = 0.0;
+    // Store last Nyquist axis bounds for inverse mapping during drag
+    double nyqReMin = -1.5, nyqReMax = 1.0, nyqImMin = -1.0, nyqImMax = 1.0;
+    float  nyqGx = 0.f, nyqGy = 0.f, nyqGw = 1.f, nyqGh = 1.f;
+
+    auto buildCoeffs = [&](std::vector<double>& num, std::vector<double>& den) {
+        if (circuitMode) {
+            // When inductor is bypassed, force L=0 regardless of slider
+            double effectiveL = inductorActive ? slL.value : 0.0;
+            auto cc = circuitCoeffs(slR.value, effectiveL, slC.value, circType);
+            num = cc.num; den = cc.den;
+        } else {
+            num = parseCoeffs(numStr);
+            den = parseCoeffs(denStr);
+        }
+    };
+
+    auto replot = [&]()
+    {
+        std::vector<double> num, den;
+        buildCoeffs(num, den);
+        // safeParseDouble already clamps to [1.0, 1e12] and handles empty/invalid
+        maxFreq = safeParseDouble(maxFreqStr, 1e6, 1.0, 1e12);
+
+        bode = computeBode(num, den, maxFreq);
+        if (bode.valid) {
+            double mn = *std::min_element(bode.mag.begin(),   bode.mag.end());
+            double mx = *std::max_element(bode.mag.begin(),   bode.mag.end());
+            double pd = std::max((mx-mn)*0.15, 10.0);
+            magMin = std::floor((mn-pd)/20.0)*20.0;
+            magMax = std::ceil ((mx+pd)/20.0)*20.0;
+            if (magMax-magMin < 20.0) { magMin-=20.0; magMax+=20.0; }
+
+            double pn = *std::min_element(bode.phase.begin(), bode.phase.end());
+            double px = *std::max_element(bode.phase.begin(), bode.phase.end());
+            double pp = std::max((px-pn)*0.15, 20.0);
+            phMin = std::floor((pn-pp)/45.0)*45.0;
+            phMax = std::ceil ((px+pp)/45.0)*45.0;
+            if (phMax-phMin < 45.0) { phMin-=45.0; phMax+=45.0; }
+
+            stab = StabilityAnalyzer::analyze(bode, num, den);
+            nyquist = computeNyquist(num, den, maxFreq);
+            statusMsg = "Computed. " + std::to_string(bode.freq.size()) + " samples.";
+
+            if (lowerPanelView == 2) {
+                // safeParseDouble returns -1.0 (fallback) when the field is
+                // empty, which signals computeStep/computeStepRLC to auto-scale.
+                double userT = safeParseDouble(stepMaxTimeStr, -1.0, 1e-15, 1e6);
+                if (circuitMode) {
+                    double effectiveL = inductorActive ? slL.value : 0.0;
+                    step = computeStepRLC(slR.value, effectiveL, slC.value,
+                                        static_cast<CircuitType>(circType), 
+                                        600, userT);
+                } else {
+                    step = computeStep(num, den, 600, userT);
+                }
+            }
+        } else {
+            statusMsg = "Invalid input.";
+            stab = {};
+        }
+        needsReplot = false;
+    };
+    replot();
+
+    sf::Vector2f mouse{-1.f,-1.f};
+    static bool prevLMB = false;
+
+    while (window.isOpen())
+    {
+        // ── Responsive layout ────────────────────────────────────────────────
+        sf::Vector2u wsize = window.getSize();
+        float WIN_W   = static_cast<float>(wsize.x);
+        float WIN_H   = static_cast<float>(wsize.y);
+        // Fixed sidebar width for clean separation (no overlap with Y-axis labels)
+        const float SIDEBAR_WIDTH = 320.f;
+        const float LEFT_PADDING  = 62.f;   // space for Y-axis labels
+        const float RIGHT_PAD     = 24.f;
+        float PANEL_W = std::clamp(SIDEBAR_WIDTH, 240.f, 340.f);
+
+        // Graph area: starts after sidebar, padded for Y-axis labels
+        float graphAreaX = PANEL_W;
+        float graphAreaW = WIN_W - PANEL_W;
+        float GRAPH_X    = graphAreaX + LEFT_PADDING;
+        float GRAPH_W    = graphAreaW - LEFT_PADDING - RIGHT_PAD;
+
+        // Distribute graph heights proportionally (not hardcoded)
+        float topPad   = 80.f;   // increased: 30px extra for Enable-L button row
+        float midGap   = 72.f;
+        float botPad   = 70.f;
+        float totalGH  = WIN_H - topPad - midGap - botPad;
+        float GMAG_H   = totalGH * 0.47f;
+        float GPH_H    = totalGH * 0.47f;
+        GMAG_H = std::max(GMAG_H, 100.f);
+        GPH_H  = std::max(GPH_H,  100.f);
+        float GMAG_Y   = topPad;
+        float GPH_Y    = GMAG_Y + GMAG_H + midGap;
+
+        double logMaxFreq = std::log10(std::max(maxFreq, 1.0));
+
+        float slW = PANEL_W - 40.f;
+        float slX = 20.f;
+        slR.w = slL.w = slC.w = slW;
+        slR.x = slL.x = slC.x = slX;
+
+        // ── Enable-L toggle button (in graph area header, above magnitude plot) ─
+        // Sits in the top strip between the sidebar right edge and window right edge.
+        // Centred horizontally in the graph column, vertically between y=8 and topPad-8.
+        const float ENBL_BTN_W = 130.f;
+        const float ENBL_BTN_H = 26.f;
+        float enblBtnX = GRAPH_X + (GRAPH_W - ENBL_BTN_W) * 0.5f;
+        float enblBtnY = 10.f;
+        // Colour-coded: green when active, red when bypassed
+        sf::Color enblBgCol  = inductorActive ? sf::Color{30,140,60}   : sf::Color{160,40,40};
+        sf::Color enblTxtCol = sf::Color{240,240,240};
+        std::string enblLabel = inductorActive ? "L ACTIVE (RLC)" : "L BYPASSED (RC)";
+        Btn btnEnableL { enblBtnX, enblBtnY, ENBL_BTN_W, ENBL_BTN_H, enblLabel };
+
+        // ── Events ───────────────────────────────────────────────────────────
+        while (auto ev = window.pollEvent())
+        {
+            if (ev->is<sf::Event::Closed>()) window.close();
+
+            if (ev->is<sf::Event::Resized>()) {
+                // Re-read the updated size so layout variables reflect new dims
+                sf::Vector2u rsz = window.getSize();
+                float rW = static_cast<float>(rsz.x);
+                float rH = static_cast<float>(rsz.y);
+                sf::View view;
+                view.setViewport({{0.f,0.f},{1.f,1.f}});
+                view.setSize({rW, rH});
+                view.setCenter({rW*0.5f, rH*0.5f});
+                window.setView(view);
+            }
+
+            if (auto* mm = ev->getIf<sf::Event::MouseMoved>()) {
+                mouse = window.mapPixelToCoords(mm->position);
+                if (draggingSlider) {
+                    draggingSlider->setFromX(mouse.x);
+                    // Sync precision text fields from slider positions
+                    { std::ostringstream o; o << std::setprecision(6) << slR.value; rStr = o.str(); }
+                    { std::ostringstream o; o << std::setprecision(6) << slL.value; lStr = o.str(); }
+                    { std::ostringstream o; o << std::setprecision(6) << slC.value; cStr = o.str(); }
+                    needsReplot = true;
+                }
+                // Nyquist pan drag update
+                if (nyqDragging && nyqGw > 1.f && nyqGh > 1.f) {
+                    double dataW = nyqReMax - nyqReMin;
+                    double dataH = nyqImMax - nyqImMin;
+                    double dx = (mouse.x - nyqDragStart.x) / nyqGw * dataW;
+                    double dy = (mouse.y - nyqDragStart.y) / nyqGh * dataH;
+                    nyqPanX = nyqDragPanX0 - dx;
+                    nyqPanY = nyqDragPanY0 + dy;
+                }
+            }
+
+            if (auto* mb = ev->getIf<sf::Event::MouseButtonPressed>()) {
+                if (mb->button == sf::Mouse::Button::Left) {
+                    auto wp = window.mapPixelToCoords(mb->position);
+                    if (circuitMode) {
+                        if (slR.hitThumb(wp.x,wp.y)||slR.hitTrack(wp.x,wp.y)) { draggingSlider=&slR; slR.dragging=true; slR.setFromX(wp.x); needsReplot=true; }
+                        // L slider only interactive when inductor is active
+                        else if (inductorActive && (slL.hitThumb(wp.x,wp.y)||slL.hitTrack(wp.x,wp.y))) { draggingSlider=&slL; slL.dragging=true; slL.setFromX(wp.x); needsReplot=true; }
+                        else if (slC.hitThumb(wp.x,wp.y)||slC.hitTrack(wp.x,wp.y)) { draggingSlider=&slC; slC.dragging=true; slC.setFromX(wp.x); needsReplot=true; }
+                    }
+                    // Nyquist pan drag — start; double-click resets pan
+                    if (lowerPanelView == 1 && wp.x >= nyqGx && wp.x <= nyqGx+nyqGw &&
+                        wp.y >= nyqGy && wp.y <= nyqGy+nyqGh) {
+                        static sf::Clock nyqClickClock;
+                        static int nyqClickCount = 0;
+                        float elapsed = nyqClickClock.restart().asSeconds();
+                        nyqClickCount = (elapsed < 0.35f) ? nyqClickCount + 1 : 1;
+                        if (nyqClickCount >= 2) {
+                            // Double-click: reset pan
+                            nyqPanX = 0.0; nyqPanY = 0.0;
+                            nyqClickCount = 0;
+                        } else {
+                            nyqDragging   = true;
+                            nyqDragStart  = wp;
+                            nyqDragPanX0  = nyqPanX;
+                            nyqDragPanY0  = nyqPanY;
+                        }
+                    }
+                }
+            }
+
+            if (auto* mb = ev->getIf<sf::Event::MouseButtonReleased>()) {
+                if (mb->button == sf::Mouse::Button::Left) {
+                    if (draggingSlider) { draggingSlider->dragging = false; draggingSlider = nullptr; }
+                    nyqDragging = false;
+                }
+            }
+
+            if (auto* te = ev->getIf<sf::Event::TextEntered>()) {
+                if (appState == AppState::DASHBOARD) {
+                    // Manual mode boxes
+                    if (activeBox >= 0) {
+                        std::string* s = (activeBox==0) ? &numStr
+                                       : (activeBox==1) ? &denStr
+                                       : (activeBox==2) ? &maxFreqStr
+                                                        : &stepMaxTimeStr;
+                        uint32_t ch = te->unicode;
+                        if (ch == 8u && !s->empty()) s->pop_back();
+                        else if (ch >= 32u && ch < 127u) *s += char(ch);
+                    }
+                    // Circuit RLC text boxes — L box blocked when inductor bypassed
+                    if (activeRLCBox >= 0 && circuitMode) {
+                        // Block editing the L field if inductor is bypassed
+                        if (activeRLCBox == 1 && !inductorActive) { /* blocked */ }
+                        else {
+                            std::string* s = (activeRLCBox==0) ? &rStr
+                                           : (activeRLCBox==1) ? &lStr
+                                                               : &cStr;
+                            uint32_t ch = te->unicode;
+                            if (ch == 8u && !s->empty()) s->pop_back();
+                            else if (ch >= 32u && ch < 127u) *s += char(ch);
+                            // ── Live-sync: update slider as user types ────────────
+                            // safeParseDouble returns the fallback (current slider
+                            // value) when the field is empty or mid-edit, so the
+                            // slider never jumps to 0 while the user is typing.
+                            // We only trigger a replot if the value actually changed
+                            // AND the string represents a complete valid number.
+                            {
+                                double curVal = (activeRLCBox==0) ? slR.value
+                                              : (activeRLCBox==1) ? slL.value
+                                                                  : slC.value;
+                                // Use current slider as fallback so an empty field
+                                // leaves the last good value in place.
+                                double parsed = safeParseDouble(*s, curVal, 0.0, 1e12);
+                                bool numericAndComplete =
+                                    !s->empty() && parsed != curVal;
+
+                                if (activeRLCBox==0 && parsed >= 0)
+                                    slR.value = std::clamp(parsed, slR.vmin, slR.vmax);
+                                if (activeRLCBox==1 && parsed >= 0)
+                                    slL.value = std::clamp(parsed, slL.vmin, slL.vmax);
+                                if (activeRLCBox==2 && parsed >= 0)
+                                    slC.value = std::clamp(parsed, slC.vmin, slC.vmax);
+
+                                if (numericAndComplete) needsReplot = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (auto* ke = ev->getIf<sf::Event::KeyPressed>()) {
+                if (appState == AppState::WELCOME) {
+                    welcome.triggerExit();
+                } else {
+                    if (ke->code == sf::Keyboard::Key::Enter) {
+                        needsReplot = true;
+                        // Auto-center sliders when Enter pressed in an RLC box.
+                        // safeParseDouble returns the current slider value on an
+                        // empty/invalid field, so recalibrate() is never called
+                        // with 0 (which would collapse the slider range).
+                        if (activeRLCBox >= 0 && circuitMode) {
+                            if (activeRLCBox == 0) {
+                                double v = safeParseDouble(rStr, slR.value, 0.0, 1e9);
+                                if (v > 0) slR.recalibrate(v);
+                            } else if (activeRLCBox == 1) {
+                                double v = safeParseDouble(lStr, slL.value, 0.0, 1e3);
+                                if (v > 0) slL.recalibrate(v);
+                            } else {
+                                double v = safeParseDouble(cStr, slC.value, 0.0, 1e-3);
+                                if (v > 0) slC.recalibrate(v);
+                            }
+                        }
+                    }
+                    if (ke->code == sf::Keyboard::Key::Tab && activeBox >= 0)
+                        activeBox = (activeBox + 1) % 4;
+                    if (ke->code == sf::Keyboard::Key::Tab && activeRLCBox >= 0)
+                        activeRLCBox = (activeRLCBox + 1) % 3;
+                    if (ke->code == sf::Keyboard::Key::Escape) { activeBox = -1; activeRLCBox = -1; }
+                }
+            }
+        }
+
+        // ── Welcome screen update ─────────────────────────────────────────────
+        if (appState == AppState::WELCOME) {
+            if (welcome.update()) appState = AppState::DASHBOARD;
+        }
+
+        // ── Dashboard button layout: responsive via currentY tracker ──────────
+        //
+        // We compute a dynamic currentY that stacks elements from top to bottom.
+        // The BOTTOM buttons (Theme, Export) are anchored from the bottom up,
+        // so they are always visible regardless of window height.
+        //
+        float bx = 20.f, bw = PANEL_W - 40.f;
+
+        // Bottom-anchored buttons — always at WIN_H - padding, going upward
+        const float BTN_H    = 34.f;
+        const float BTN_GAP  = 6.f;
+        const float BOT_PAD  = 30.f;
+
+        // Stack from bottom: Export, Theme, Phase(cycle), Ghost, Circuit
+        float botY = WIN_H - BOT_PAD - BTN_H;
+        Btn btnExport  {bx, botY,                             bw, BTN_H, "EXPORT REPORT"};
+        Btn btnTheme   {bx, botY - (BTN_H+BTN_GAP),          bw, BTN_H, darkTheme ? "LIGHT THEME" : "DARK THEME"};
+        // Phase button cycles: Phase -> Nyquist -> Step Response
+        std::string phaseLabel = (lowerPanelView==0) ? "SHOW NYQUIST"
+                               : (lowerPanelView==1) ? "SHOW STEP RESP"
+                                                     : "SHOW PHASE";
+        Btn btnStep    {bx, botY - (BTN_H+BTN_GAP)*2.f,      bw, BTN_H, phaseLabel};
+        Btn btnGhost   {bx, botY - (BTN_H+BTN_GAP)*3.f,      bw, BTN_H, "SAVE GHOST"};
+        Btn btnCircuit {bx, botY - (BTN_H+BTN_GAP)*4.f,      bw, BTN_H, circuitMode ? "MANUAL MODE" : "CIRCUIT MODE"};
+        float bottomBtnTop = btnCircuit.y - BTN_GAP;  // separator line above these
+
+        // Top-anchored: title, inputs/sliders, PLOT button
+        float currentY = 62.f;  // below logo
+
+        // Manual mode input boxes — no hint text, tighter vertical spacing
+        IBox boxes[4] = {
+            {bx, currentY + 14.f,  bw, 34.f, &numStr,        "Numerator [high >> low]:",  ""},
+            {bx, currentY + 62.f,  bw, 34.f, &denStr,        "Denominator [high >> low]:", ""},
+            {bx, currentY + 110.f, bw, 34.f, &maxFreqStr,    "Max Freq (Hz):",          ""},
+            {bx, currentY + 158.f, bw, 34.f, &stepMaxTimeStr,"Max Step Time (s):",      ""}
+        };
+        float inputsBottom = currentY + 200.f;
+
+        // Circuit mode header Y
+        float circHeaderY = currentY;
+
+        // Circuit type sub-buttons (only in circuit mode) — below header
+        Btn btnLP {bx,          circHeaderY + 20.f, bw/3.f-4.f, 26.f, "Low-P"};
+        Btn btnHP {bx+bw/3.f,   circHeaderY + 20.f, bw/3.f-4.f, 26.f, "High-P"};
+        Btn btnBP {bx+2*bw/3.f, circHeaderY + 20.f, bw/3.f-4.f, 26.f, "Band-P"};
+
+        // RLC precision text input boxes (circuit mode) — below type buttons
+        float rlcBoxY0 = circHeaderY + 56.f;
+        // Small input boxes: label on left, box on right
+        float rlcLabelW = 68.f;
+        float rlcBoxW   = bw - rlcLabelW - 4.f;
+        float rlcBoxH   = 24.f;
+        float rlcGap    = 32.f;
+        // Hit-test rects for click detection
+        struct RLCBox { float x, y, w, h; bool hit(float px,float py) const { return px>=x&&px<x+w&&py>=y&&py<y+h; } };
+        RLCBox rlcBoxes[3] = {
+            {bx + rlcLabelW, rlcBoxY0,            rlcBoxW, rlcBoxH},
+            {bx + rlcLabelW, rlcBoxY0 + rlcGap,   rlcBoxW, rlcBoxH},
+            {bx + rlcLabelW, rlcBoxY0 + rlcGap*2, rlcBoxW, rlcBoxH}
+        };
+
+        // Sliders — below RLC input boxes
+        float slY0 = rlcBoxY0 + rlcGap*3 + 8.f;
+        slR.y = slY0;
+        slL.y = slY0 + 52.f;
+        slC.y = slY0 + 104.f;
+
+        // PLOT button just after inputs (only in manual mode; circuit is live)
+        float plotBtnY = circuitMode ? (slC.y + 42.f) : (inputsBottom + 10.f);
+        Btn btnPlot {bx, plotBtnY, bw, BTN_H, "PLOT"};
+
+        // ── Stability Report: in circuit mode skip plot button height ─────────
+        float stabY   = circuitMode ? (slC.y + 42.f + 6.f) : (plotBtnY + BTN_H + 14.f);
+        float stabH   = 108.f;
+
+        // ── S-Plane: fills remaining space between stability report and bottom buttons ─
+        float spaceForSPlane = bottomBtnTop - (stabY + stabH) - 20.f;
+        float spSz = std::clamp(spaceForSPlane - 12.f, 0.f, PANEL_W - 28.f);
+        float spY  = stabY + stabH + 10.f;
+
+        // ── Hover states ─────────────────────────────────────────────────────
+        auto updateHov = [&](Btn& b) { b.hov = b.hit(mouse.x, mouse.y); };
+        updateHov(btnPlot); updateHov(btnExport); updateHov(btnGhost);
+        updateHov(btnTheme); updateHov(btnStep); updateHov(btnCircuit);
+        updateHov(btnLP); updateHov(btnHP); updateHov(btnBP);
+        updateHov(btnEnableL);
+
+        // ── Frame click handling ──────────────────────────────────────────────
+        bool curLMB = sf::Mouse::isButtonPressed(sf::Mouse::Button::Left);
+        bool clicked = curLMB && !prevLMB;
+        prevLMB = curLMB;
+
+        if (clicked && !draggingSlider && appState == AppState::DASHBOARD) {
+            float mx = mouse.x, my = mouse.y;
+            if (!circuitMode) {
+                activeBox = -1;
+                activeRLCBox = -1;
+                for (int i = 0; i < 4; ++i)
+                    if (boxes[i].hit(mx,my)) activeBox = i;
+            } else {
+                // In circuit mode: check RLC precision input boxes
+                activeBox = -1;
+                activeRLCBox = -1;
+                for (int i = 0; i < 3; ++i) {
+                    // L box (i==1) cannot be focused when inductor is bypassed
+                    if (i == 1 && !inductorActive) continue;
+                    if (rlcBoxes[i].hit(mx,my)) activeRLCBox = i;
+                }
+            }
+            // ── Enable-L toggle (always visible in circuit mode) ──────────────
+            if (circuitMode && btnEnableL.hit(mx,my)) {
+                inductorActive = !inductorActive;
+                // When bypassing L, Band-Pass falls back to LP
+                if (!inductorActive && circType == CircuitType::BandPass)
+                    circType = CircuitType::LowPass;
+                needsReplot = true;
+            }
+            // PLOT button only shown/used in manual mode
+            if (!circuitMode && btnPlot.hit(mx,my)) needsReplot = true;
+            if (btnExport.hit(mx,my) && bode.valid) {
+                std::vector<double> expNum, expDen;
+                buildCoeffs(expNum, expDen);
+                // Ensure step is computed for report even if not currently shown
+                StepData stepForReport = step;
+                if (!stepForReport.valid) {
+                    double userT = safeParseDouble(stepMaxTimeStr, -1.0, 1e-15, 1e6);
+                    stepForReport = computeStep(expNum, expDen, 600, userT);
+                }
+                exportCSV(bode, nyquist, stepForReport, stab, expNum, expDen, traces, statusMsg);
+            }
+            if (btnGhost.hit(mx,my) && bode.valid)
+                traces.saveFromBode(bode, magMin, magMax, phMin, phMax, logMaxFreq);
+            if (btnTheme.hit(mx,my)) {
+                darkTheme = !darkTheme;
+                T = darkTheme ? T_DARK : T_LIGHT;
+            }
+            if (btnStep.hit(mx,my)) {
+                // Cycle: Phase(0) -> Nyquist(1) -> Step(2) -> Phase(0)
+                lowerPanelView = (lowerPanelView + 1) % 3;
+                needsReplot = true;
+            }
+            if (btnCircuit.hit(mx,my)) {
+                circuitMode = !circuitMode;
+                needsReplot = true;
+            }
+            if (circuitMode) {
+                // Live update on circuit type selection
+                if (btnLP.hit(mx,my)) { circType = CircuitType::LowPass;   needsReplot=true; }
+                if (btnHP.hit(mx,my)) { circType = CircuitType::HighPass;  needsReplot=true; }
+                // Band-Pass only allowed when inductor is active
+                if (btnBP.hit(mx,my) && inductorActive) { circType = CircuitType::BandPass; needsReplot=true; }
+            }
+        }
+
+        if (needsReplot) replot();
+
+        // ════════════════════════════════════════════════════════════════════
+        //  DRAW
+        // ════════════════════════════════════════════════════════════════════
+        window.clear(T.bg);
+
+        if (appState == AppState::DASHBOARD) {
+
+        // ─ Left panel ────────────────────────────────────────────────────────
+        drawRect(window, 0.f, 0.f, PANEL_W, WIN_H, T.panel);
+        drawLine(window, PANEL_W, 0.f, PANEL_W, WIN_H, T.line_sep);
+
+        if (fontOk) {
+            // Title
+            drawText(window, font, "BODE",         22.f, 14.f, 22, T.accent);
+            drawText(window, font, " PLOTTER PRO", 80.f, 20.f, 13, T.text_hi);
+            drawLine(window, 14.f, 56.f, PANEL_W-14.f, 56.f, T.line_sep);
+
+            if (!circuitMode) {
+                // Manual mode inputs
+                for (int i = 0; i < 4; ++i) {
+                    auto& b = boxes[i];
+                    bool act = (activeBox == i);
+                    drawText(window, font, b.label, b.x, b.y - 15.f, 11, T.text_lo);
+                    drawRect(window, b.x, b.y, b.w, b.h,
+                             T.in_bg, act ? T.accent : T.border, 1.5f);
+                    std::string disp = *b.text;
+                    if (act) disp += '|';
+                    while (disp.size() > 26) disp = disp.substr(1);
+                    drawText(window, font, disp, b.x+8.f, b.y+9.f, 13,
+                             act ? T.text_hi : T.text_lo);
+                    // hint text intentionally omitted
+                }
+            } else {
+                // ── Circuit Mode Sidebar ──────────────────────────────────────
+                drawText(window, font, "CIRCUIT MODE", 22.f, circHeaderY, 12, T.accent);
+
+                // Filter type buttons — Band-Pass grayed when L is bypassed
+                for (auto* btn : {&btnLP, &btnHP, &btnBP}) {
+                    bool isBP  = (btn == &btnBP);
+                    bool disabled = isBP && !inductorActive;
+                    bool sel = !disabled &&
+                               ((btn == &btnLP && circType == CircuitType::LowPass)
+                             || (btn == &btnHP && circType == CircuitType::HighPass)
+                             || (btn == &btnBP && circType == CircuitType::BandPass));
+                    sf::Color bg = disabled ? sf::Color{38,38,38}
+                                 : sel      ? T.accent : T.in_bg;
+                    sf::Color tc = disabled ? sf::Color{65,65,65}
+                                 : sel      ? T.bg     : T.accent;
+                    sf::Color br = disabled ? sf::Color{50,50,50} : T.border;
+                    drawRect(window, btn->x, btn->y, btn->w, btn->h, bg, br, 1.f);
+                    drawText(window, font, btn->label,
+                             btn->x + btn->w*0.5f, btn->y + 7.f, 11, tc, true);
+                    // Strikethrough on disabled BP
+                    if (disabled) {
+                        float midY = btn->y + btn->h * 0.5f;
+                        drawLine(window, btn->x + 4.f, midY, btn->x + btn->w - 4.f, midY,
+                                 sf::Color{80,80,80});
+                    }
+                }
+
+                // RLC precision input fields — L row grayed when bypassed
+                const char* rlcLabels[3] = {"R (Ohms):", "L (H):", "C (F):"};
+                std::string* rlcStrs[3]  = {&rStr, &lStr, &cStr};
+                for (int i = 0; i < 3; ++i) {
+                    bool rowDisabled = (i == 1 && !inductorActive);
+                    float ly = rlcBoxY0 + i * rlcGap;
+                    bool act = (!rowDisabled && activeRLCBox == i);
+                    sf::Color lblCol = rowDisabled ? sf::Color{55,55,55}
+                                     : act        ? T.accent : T.text_lo;
+                    sf::Color boxBdr = rowDisabled ? sf::Color{45,45,45}
+                                     : act        ? T.accent : T.border;
+                    sf::Color boxBg  = rowDisabled ? sf::Color{22,22,22} : T.in_bg;
+                    sf::Color txtCol = rowDisabled ? sf::Color{55,55,55}
+                                     : act        ? T.text_hi : T.text_lo;
+                    drawText(window, font, rlcLabels[i], bx, ly + 5.f, 10, lblCol);
+                    drawRect(window, rlcBoxes[i].x, rlcBoxes[i].y,
+                             rlcBoxes[i].w, rlcBoxes[i].h, boxBg, boxBdr, 1.5f);
+                    std::string disp = rowDisabled ? "-- bypassed --" : *rlcStrs[i];
+                    if (act) disp += '|';
+                    while (!rowDisabled && disp.size() > 14) disp = disp.substr(1);
+                    drawText(window, font, disp,
+                             rlcBoxes[i].x + 4.f, rlcBoxes[i].y + 5.f, 10, txtCol);
+                }
+
+                // Sliders — L slider grayed when inductor bypassed
+                drawSlider(window, font, slR, fontOk, false);
+                drawSlider(window, font, slL, fontOk, !inductorActive);
+                drawSlider(window, font, slC, fontOk, false);
+
+                // Status tag under L slider
+                {
+                    float midX = slL.x + slL.w * 0.5f;
+                    if (!inductorActive) {
+                        drawText(window, font, "[BYPASSED — 1st-order RC]",
+                                 midX, slL.y + 22.f, 9, sf::Color{160,60,60}, true);
+                    }
+                }
+
+                // Transfer function preview
+                std::vector<double> pnum, pden;
+                buildCoeffs(pnum, pden);
+                // Use effectiveL for preview (respects inductor bypass)
+                double effectiveL_preview = inductorActive ? slL.value : 0.0;
+                auto cc_preview = circuitCoeffs(slR.value, effectiveL_preview, slC.value, circType);
+                std::string ns = polyToStr(pnum);
+                std::string ds = polyToStr(pden);
+                if (!cc_preview.bandPassMsg.empty()) {
+                    drawText(window, font, cc_preview.bandPassMsg,
+                             PANEL_W*0.5f, slC.y + 40.f, 10, T.bad, true);
+                }
+                if (ns.size() > 22) ns = ns.substr(0,19) + "...";
+                if (ds.size() > 22) ds = ds.substr(0,19) + "...";
+                float hy = slC.y + (cc_preview.bandPassMsg.empty() ? 38.f : 56.f);
+                // drawText(window, font, "H(s) =", 22.f, hy, 11, T.text_lo);
+                // drawText(window, font, ns, 22.f, hy+14.f, 11, T.text_hi);
+                // drawLine(window, 22.f, hy+28.f, PANEL_W-22.f, hy+28.f, T.accent);
+                // drawText(window, font, ds, 22.f, hy+32.f, 11, T.text_hi);
+            }
+
+            // PLOT button (manual mode only — circuit mode is live-update)
+            if (!circuitMode) drawBtn(window, font, btnPlot, T.accent);
+
+            // ── Stability Report ──────────────────────────────────────────────
+            drawLine(window, 14.f, stabY - 8.f, PANEL_W-14.f, stabY - 8.f, T.line_sep);
+            drawText(window, font, "STABILITY REPORT", 22.f, stabY, 11, T.text_lo);
+            drawRect(window, 14.f, stabY+14.f, PANEL_W-28.f, stabH, T.in_bg, T.border, 1.f);
+
+            if (stab.valid) {
+                sf::Color stabCol = stab.stable ? T.good : T.bad;
+                std::string verdict = stab.stable ? "STABLE" : "UNSTABLE";
+                if (stab.rhpPole) verdict = "UNSTABLE (RHP Pole)";
+                drawText(window, font, verdict, PANEL_W*0.5f, stabY+18.f, 12, stabCol, true);
+
+                float ry = stabY + 36.f;
+
+                // ── Bandwidth / Cutoff (−3 dB from peak) ─────────────────────
+                if (stab.hasFc) {
+                    std::ostringstream o;
+                    o << "Fc = " << freqLabel(stab.fcHz);
+                    drawText(window, font, o.str(), 22.f, ry, 11, T.text_hi);
+                    ry += 15.f;
+                }
+
+                // ── Gain Crossover + Phase Margin ─────────────────────────────
+                if (stab.hasFgc) {
+                    std::ostringstream ofgc;
+                    ofgc << "fgc= " << freqLabel(stab.fgcHz);
+                    drawText(window, font, ofgc.str(), 22.f, ry, 11, T.text_hi);
+                    ry += 14.f;
+                    std::ostringstream pm;
+                    pm << std::fixed << std::setprecision(1) << "PM = " << stab.pmDeg << " deg";
+                    drawText(window, font, pm.str(), 22.f, ry, 11,
+                             stab.pmStable ? T.good : T.bad);
+                    ry += 16.f;
+                } else {
+                    drawText(window, font, "PM = inf (no 0dB cross)", 22.f, ry, 10, T.good);
+                    ry += 16.f;
+                }
+
+                // ── Phase Crossover + Gain Margin ─────────────────────────────
+                if (stab.hasFpi) {
+                    std::ostringstream ofpi;
+                    ofpi << "fpi= " << freqLabel(stab.fpiHz);
+                    drawText(window, font, ofpi.str(), 22.f, ry, 11, T.text_hi);
+                    ry += 14.f;
+                    std::ostringstream gm;
+                    if (stab.gmDb >= 100.0)
+                        gm << "GM ≥ 100 dB (stable)";
+                    else if (stab.gmDb <= -100.0)
+                        gm << "GM ≤ -100 dB (unstable)";
+                    else
+                        gm << std::fixed << std::setprecision(1) << "GM = " << stab.gmDb << " dB";
+                    drawText(window, font, gm.str(), 22.f, ry, 11,
+                             stab.gmStable ? T.good : T.bad);
+                } else {
+                    drawText(window, font, "GM = inf (no -180 cross)", 22.f, ry, 10, T.good);
+                }
+            } else {
+                drawText(window, font, "No data",
+                         PANEL_W*0.5f, stabY+52.f, 11, T.text_lo, true);
+            }
+
+            // ── S-Plane widget (only if there's enough vertical space) ────────
+            if (spSz >= 60.f) {
+                drawLine(window, 14.f, spY - 6.f, PANEL_W-14.f, spY - 6.f, T.line_sep);
+                drawSPlane(window, font, fontOk, stab, 14.f, spY, spSz);
+            }
+
+            // ── Bottom separator + action buttons ─────────────────────────────
+            drawLine(window, 14.f, bottomBtnTop, PANEL_W-14.f, bottomBtnTop, T.line_sep);
+            drawBtn(window, font, btnCircuit, {200,120,60});
+            drawBtn(window, font, btnGhost,   T.accent);
+            drawBtn(window, font, btnStep,    {100,200,150});
+            drawBtn(window, font, btnTheme,   {100,150,230});
+            drawBtn(window, font, btnExport,  T.accent);
+        } // fontOk
+
+        // ── Enable-L toggle button — drawn in top strip of graph area ──────────
+        if (circuitMode && fontOk) {
+            // Pill-shaped background
+            drawRect(window, enblBtnX - 2.f, enblBtnY - 2.f,
+                     ENBL_BTN_W + 4.f, ENBL_BTN_H + 4.f,
+                     inductorActive ? sf::Color{15,60,25} : sf::Color{60,15,15},
+                     inductorActive ? sf::Color{40,180,80} : sf::Color{180,50,50}, 1.5f);
+            drawRect(window, enblBtnX, enblBtnY, ENBL_BTN_W, ENBL_BTN_H, enblBgCol);
+            // Status dot
+            sf::CircleShape dot(5.f);
+            dot.setFillColor(inductorActive ? sf::Color{80,230,110} : sf::Color{230,80,80});
+            dot.setOrigin({5.f,5.f});
+            dot.setPosition({enblBtnX + 12.f, enblBtnY + ENBL_BTN_H * 0.5f});
+            window.draw(dot);
+            // Label
+            drawText(window, font, enblLabel,
+                     enblBtnX + ENBL_BTN_W * 0.5f + 5.f,
+                     enblBtnY + ENBL_BTN_H * 0.5f - 7.f,
+                     11, enblTxtCol, true);
+            // Hint line below button
+            drawText(window, font,
+                     inductorActive ? "2nd-order RLC active" : "1st-order RC (L=0)",
+                     enblBtnX + ENBL_BTN_W * 0.5f,
+                     enblBtnY + ENBL_BTN_H + 2.f,
+                     9, inductorActive ? sf::Color{60,180,80} : sf::Color{180,80,60}, true);
+        }
+
+        // ─ Right panel — Graphs ───────────────────────────────────────────────
+        // Determine lower panel content
+        bool showStep    = (lowerPanelView == 2);
+        bool showNyquist = (lowerPanelView == 1);
+        bool showPhase   = (lowerPanelView == 0);
+
+        // DC-gain aware step Y-range with auto-scaling
+        double stepVmin = 0.0, stepVmax = 1.5;
+        if (showStep && step.valid && !step.value.empty()) {
+            double mn = *std::min_element(step.value.begin(), step.value.end());
+            double mx = *std::max_element(step.value.begin(), step.value.end());
+            double pad = std::max(std::abs(mx - mn) * 0.15, std::abs(mx) * 0.05 + 1e-9);
+            stepVmin = mn - pad;
+            stepVmax = mx + pad;
+        }
+
+        struct GDef {
+            float y, h;
+            double vmin, vmax;
+            const char* title, *unit;
+            const std::vector<double>* data;
+            bool isStep;
+            bool isNyquist;
+        } graphs[2] = {
+            {GMAG_Y, GMAG_H, magMin, magMax, "MAGNITUDE", "dB",
+             bode.valid ? &bode.mag : nullptr, false, false},
+            {GPH_Y,  GPH_H,
+             showStep    ? stepVmin : phMin,
+             showStep    ? stepVmax : phMax,
+             showStep    ? "STEP RESPONSE"
+           : showNyquist ? "NYQUIST"
+                         : "PHASE",
+             showStep    ? "amp"
+           : showNyquist ? "Im"
+                         : "deg",
+             showPhase ? (bode.valid ? &bode.phase : nullptr) : nullptr,
+             showStep,
+             showNyquist}
+        };
+
+        for (int gi = 0; gi < 2; ++gi)
+        {
+            auto& g  = graphs[gi];
+            float gx = GRAPH_X, gy = g.y, gw = GRAPH_W, gh = g.h;
+
+            // Light-mode: use white bg for graph area; dark-mode: near-black
+            sf::Color graphBg = darkTheme ? sf::Color{20,20,20} : sf::Color{255,255,255};
+            drawRect(window, gx, gy, gw, gh, graphBg, T.border, 1.f);
+
+            // Vertical (log-freq) grid
+            if (!g.isStep && !g.isNyquist) {
+                // Grid lines span from 0.01 Hz (LOG_MIN_FREQ = -2) to maxFreq
+                int decStart = static_cast<int>(std::floor(LOG_MIN_FREQ));
+                int decEnd   = static_cast<int>(std::ceil(logMaxFreq));
+                for (int dec = decStart; dec < decEnd; ++dec) {
+                    for (int m = 1; m <= 9; ++m) {
+                        double f = m * std::pow(10.0, dec);
+                        if (f < 0.009 || f > maxFreq * 1.001) continue;
+                        float px = freqToX(f, gx, gw, logMaxFreq);
+                        if (px < gx || px > gx+gw) continue;
+                        drawLine(window, px, gy, px, gy+gh,
+                                 m==1 ? T.grid_mj : T.grid_mn);
+                        if (gi == 1 && m == 1 && fontOk) {
+                            double displayedFreq = std::pow(10.0, dec) * 10.0;
+                            drawText(window, font, freqLabel(std::pow(10.0, dec)*10.0),
+                                     px-16.f, gy+gh+5.f, 10, T.text_lo);
+                        }
+                    }
+                }
+                if (gi == 1 && fontOk)
+                    drawText(window, font, freqLabel(maxFreq),
+                             gx+gw-28.f, gy+gh+5.f, 10, T.text_lo);
+            } else if (g.isStep) {
+                // Time axis linear grid
+                if (step.valid && !step.time.empty()) {
+                    double tmax = step.time.back();
+                    int nTicks = 6;
+                    for (int ti = 0; ti <= nTicks; ++ti) {
+                        float px = gx + (float(ti)/nTicks)*gw;
+                        drawLine(window, px, gy, px, gy+gh, T.grid_mj);
+                        if (gi == 1 && fontOk) {
+                            std::ostringstream o;
+                            double tv = tmax * ti / nTicks;
+                            if (tv < 1e-6)      o << std::scientific << std::setprecision(1) << tv << "s";
+                            else if (tv < 1e-3) o << std::fixed << std::setprecision(2) << tv*1e6 << "us";
+                            else if (tv < 1.0)  o << std::fixed << std::setprecision(2) << tv*1e3 << "ms";
+                            else                o << std::fixed << std::setprecision(2) << tv << "s";
+                            drawText(window, font, o.str(), px-14.f, gy+gh+5.f, 10, T.text_lo);
+                        }
+                    }
+                }
+            } else if (g.isNyquist) {
+                    // World-space Nyquist grid is drawn inside the plot rendering block below.
+                    // Nothing to draw here for the background grid pass.
+            }
+
+            // Horizontal grid
+            {
+                double range = g.vmax - g.vmin;
+                if (range > 1e-9) {
+                    double rs   = range / 7.0;
+                    double mag  = std::pow(10.0, std::floor(std::log10(std::abs(rs)+1e-300)));
+                    double nm   = rs / mag;
+                    double nc   = (nm < 1.5) ? 1 : (nm < 3.5) ? 2 : (nm < 7.5) ? 5 : 10;
+                    double step_= nc * mag;
+                    double start= std::ceil(g.vmin / step_) * step_;
+                    for (double v = start; v <= g.vmax+1e-9; v += step_) {
+                        float py = valToY(v, g.vmin, g.vmax, gy, gh);
+                        if (py < gy-1.f || py > gy+gh+1.f) continue;
+                        bool zero = std::abs(v) < 1e-9;
+                        sf::Color zeroCol = darkTheme ? sf::Color{80,80,80} : sf::Color{120,120,120};
+                        drawLine(window, gx, py, gx+gw, py,
+                                 zero ? zeroCol : T.grid_mj);
+                        // REQ 2: If this is the Nyquist view, skip all static Y-axis
+                        // labels here. The Nyquist block below draws its own dynamic
+                        // labels that scale with imMin/imMax — we must not double-draw.
+                        if (fontOk && !g.isNyquist) {
+                            std::ostringstream o;
+                            o << std::fixed << std::setprecision(g.isStep ? 2 : 0) << v;
+                            drawText(window, font, o.str(), gx-50.f, py-8.f, 11, T.text_lo);
+                        }
+                    }
+                }
+            }
+
+            if (fontOk) {
+                // ── Y-axis unit label — top-left inside each graph frame ──────
+                // For Nyquist, we place the "Im" label inside the subplot area
+                // (gx+10, gy+10) rather than at the generic gx+6/gy+4 position,
+                // and we skip the redundant far-left label entirely (REQ 3).
+                if (!g.isNyquist) {
+                    drawText(window, font, g.unit, gx + 6.f, gy + 4.f, 11, T.text_lo);
+                }
+
+                // ── Graph title — right of the unit label in top bar ──────────
+                drawText(window, font, g.title, gx + 36.f, gy + 4.f, 13, T.accent);
+
+                // ── Transfer Function fraction in top-right of Magnitude graph ──
+                if (gi == 0) {
+                    std::vector<double> tfNum, tfDen;
+                    buildCoeffs(tfNum, tfDen);
+                    std::string ns = polyToStr(tfNum);
+                    std::string ds = polyToStr(tfDen);
+                    const int MAX_TF = 28;
+                    if ((int)ns.size() > MAX_TF) ns = ns.substr(0, MAX_TF-3) + "...";
+                    if ((int)ds.size() > MAX_TF) ds = ds.substr(0, MAX_TF-3) + "...";
+                    auto measureW = [&](const std::string& str, unsigned sz) -> float {
+                        sf::Text tmp(font, str, sz);
+                        return tmp.getLocalBounds().size.x + tmp.getLocalBounds().position.x;
+                    };
+                    float nW = measureW(ns, 10);
+                    float dW = measureW(ds, 10);
+                    float fracW = std::max(nW, dW) + 16.f;
+                    float fracX = gx + gw - fracW - 10.f;
+                    float fracY = gy + 4.f;
+                    sf::Color tfBg = darkTheme ? sf::Color{30,30,30,200} : sf::Color{240,240,245,200};
+                    drawRect(window, fracX - 4.f, fracY, fracW + 8.f, 42.f, tfBg, T.border, 1.f);
+                    drawText(window, font, "H(s)", fracX, fracY + 2.f, 9, T.text_lo);
+                    float numCX = fracX + fracW * 0.5f;
+                    drawText(window, font, ns, numCX, fracY + 2.f,  10, T.text_hi, true);
+                    drawLine(window, fracX, fracY + 16.f, fracX + fracW, fracY + 16.f, T.accent);
+                    drawText(window, font, ds, numCX, fracY + 19.f, 10, T.text_hi, true);
+                }
+
+                // ── Nyquist axis label — now handled inside the plot rendering block ──
+                if (gi == 1 && showNyquist) { /* dynamic labels drawn with world grid */ }
+            }
+
+            // Ghost trace (only for Bode views)
+            if (traces.hasGhost && !g.isStep && !g.isNyquist) {
+                const auto& gv = (gi==0) ? traces.ghostMag : traces.ghostPhase;
+                traces.drawGhostDashed(window, gv, gx, gy, gw, gh);
+            }
+
+            // ── Plot rendering ───────────────────────────────────────────────────
+            if (gi == 1 && showNyquist) {
+                // ── NYQUIST PLOT ─────────────────────────────────────────────────
+                // Store graph rect for drag hit-test
+                nyqGx = gx; nyqGy = gy; nyqGw = gw; nyqGh = gh;
+
+                if (nyquist.valid && !nyquist.re.empty()) {
+                    // ── Auto-scale to data extents (computed once per replot) ──
+                    double reMin0 = *std::min_element(nyquist.re.begin(), nyquist.re.end());
+                    double reMax0 = *std::max_element(nyquist.re.begin(), nyquist.re.end());
+                    double imMin0 = *std::min_element(nyquist.im.begin(), nyquist.im.end());
+                    double imMax0 = *std::max_element(nyquist.im.begin(), nyquist.im.end());
+                    // Always include (−1, 0) and origin
+                    reMin0 = std::min(reMin0, -1.3);
+                    reMax0 = std::max(reMax0,  0.3);
+                    imMin0 = std::min(imMin0, -0.3);
+                    imMax0 = std::max(imMax0,  0.3);
+                    double rePad = std::max((reMax0 - reMin0) * 0.12, 0.15);
+                    double imPad = std::max((imMax0 - imMin0) * 0.12, 0.15);
+                    reMin0 -= rePad; reMax0 += rePad;
+                    imMin0 -= imPad; imMax0 += imPad;
+
+                    // Force equal aspect ratio so circles look circular
+                    double reSpan = reMax0 - reMin0;
+                    double imSpan = imMax0 - imMin0;
+                    double dataAspect = reSpan / (imSpan + 1e-30);
+                    double pixAspect  = gw / (gh + 1e-30);
+                    if (dataAspect > pixAspect) {
+                        // Widen imaginary range
+                        double imExtra = (reSpan / pixAspect - imSpan) * 0.5;
+                        imMin0 -= imExtra; imMax0 += imExtra;
+                    } else {
+                        // Widen real range
+                        double reExtra = (imSpan * pixAspect - reSpan) * 0.5;
+                        reMin0 -= reExtra; reMax0 += reExtra;
+                    }
+
+                    // ── Apply pan offset (world-space, not pixel-space) ────────
+                    double reMin = reMin0 + nyqPanX;
+                    double reMax = reMax0 + nyqPanX;
+                    double imMin = imMin0 + nyqPanY;
+                    double imMax = imMax0 + nyqPanY;
+
+                    // Store for inverse mapping during drag
+                    nyqReMin = reMin; nyqReMax = reMax;
+                    nyqImMin = imMin; nyqImMax = imMax;
+
+                    // ── World→Pixel mapping ────────────────────────────────────
+                    auto reToX = [&](double re) -> float {
+                        return gx + static_cast<float>((re - reMin) / (reMax - reMin)) * gw;
+                    };
+                    auto imToY = [&](double im) -> float {
+                        return gy + static_cast<float>((imMax - im) / (imMax - imMin)) * gh;
+                    };
+
+                    // ── World-space grid (moves with pan) ──────────────────────
+                    // Pick a "nice" grid step in data units
+                    auto niceStep = [](double range) -> double {
+                        double raw = range / 6.0;
+                        double p   = std::pow(10.0, std::floor(std::log10(raw + 1e-300)));
+                        double n   = raw / p;
+                        double c   = (n < 1.5) ? 1 : (n < 3.5) ? 2 : (n < 7.5) ? 0.5 : 1;
+                        return c * p;
+                    };
+                    double reStep = niceStep(reMax - reMin);
+                    double imStep = niceStep(imMax - imMin);
+
+                    // Vertical grid lines (constant Re)
+                    double reStart = std::ceil(reMin / reStep) * reStep;
+                    for (double rv = reStart; rv <= reMax + reStep * 0.01; rv += reStep) {
+                        float px = reToX(rv);
+                        if (px < gx - 1 || px > gx + gw + 1) continue;
+                        bool isZero = std::abs(rv) < reStep * 0.01;
+                        drawLine(window, px, gy, px, gy + gh,
+                                 isZero ? T.grid_mj : T.grid_mn);
+                        // Dynamic label anchored to grid line
+                        if (fontOk) {
+                            float labelY = gy + gh + 5.f;
+                            if (labelY + 12.f > gy + gh + 18.f) continue;
+                            std::ostringstream lo;
+                            lo << std::fixed << std::setprecision(std::abs(rv) < 10 ? 2 : 1) << rv;
+                            drawText(window, font, lo.str(), px - 12.f, labelY, 9, T.text_lo);
+                        }
+                    }
+
+                    // Horizontal grid lines (constant Im) — decimated dots for blueprint look
+                    double imStart = std::ceil(imMin / imStep) * imStep;
+                    for (double iv = imStart; iv <= imMax + imStep * 0.01; iv += imStep) {
+                        float py = imToY(iv);
+                        if (py < gy - 1 || py > gy + gh + 1) continue;
+                        bool isZero = std::abs(iv) < imStep * 0.01;
+
+                        if (isZero) {
+                            // Zero line: solid major line (always drawn)
+                            drawLine(window, gx, py, gx + gw, py, T.grid_mj);
+                        } else {
+                            // Non-zero lines: decimated dots (every ~12 px gap, 5 px dash)
+                            // This gives a "blueprint" engineering aesthetic
+                            const float DASH = 6.f;
+                            const float GAP  = 10.f;
+                            float xCur = gx;
+                            bool  draw = true;
+                            sf::Color dotCol = T.grid_mn;
+                            while (xCur < gx + gw) {
+                                float xEnd = std::min(xCur + (draw ? DASH : GAP), gx + gw);
+                                if (draw) drawLine(window, xCur, py, xEnd, py, dotCol);
+                                xCur = xEnd;
+                                draw = !draw;
+                            }
+                        }
+
+                        // REQ 1 & 2: Only label the SOLID zero-line (major Im axis).
+                        // Dashed (non-zero) Im lines get NO text label to prevent
+                        // overlap/clutter. The static far-left "Im" label is also
+                        // suppressed here — a single inside-subplot label is added below.
+                        if (fontOk && isZero) {
+                            std::ostringstream lo;
+                            lo << std::fixed << std::setprecision(std::abs(iv) < 10 ? 2 : 1) << iv;
+                            // Clip: only draw if py is inside the graph
+                            if (py >= gy && py <= gy + gh)
+                                drawText(window, font, lo.str(), gx - 44.f, py - 7.f, 9, T.text_lo);
+                        }
+                    }
+
+                    // ── Draw the Nyquist curve (clipped to graph bounds) ──────
+                    // Positive-frequency sweep (H(jω)) → SOLID line.
+                    // Reflected sweep  (H(-jω) conjugate mirror) → DASHED line.
+                    // This clearly separates "calculated data" from the mathematical
+                    // mirror required for Nyquist stability encirclement counting.
+                    size_t N = nyquist.re.size();
+                    size_t solidEnd = nyquist.posCount;   // solid up to this index
+
+                    // Save current view, switch to clipped viewport
+                    sf::View savedView = window.getView();
+                    {
+                        sf::Vector2u wsize2 = window.getSize();
+                        float winW = static_cast<float>(wsize2.x);
+                        float winH = static_cast<float>(wsize2.y);
+                        sf::View clipView;
+                        clipView.setSize({gw, gh});
+                        clipView.setCenter({gx + gw * 0.5f, gy + gh * 0.5f});
+                        clipView.setViewport(sf::FloatRect{
+                            {gx / winW, gy / winH},
+                            {gw / winW, gh / winH}
+                        });
+                        window.setView(clipView);
+
+                        // ── Solid segment: positive-frequency sweep ────────────
+                        if (solidEnd > 1) {
+                            sf::VertexArray vaSolid(sf::PrimitiveType::LineStrip, solidEnd);
+                            for (size_t i = 0; i < solidEnd; ++i) {
+                                float px = reToX(nyquist.re[i]);
+                                float py = imToY(nyquist.im[i]);
+                                vaSolid[i] = sf::Vertex{{px, py}, T.accent};
+                            }
+                            window.draw(vaSolid);
+                        }
+
+                        // ── Dashed segment: reflected sweep H(-jω) ────────────
+                        // Rendered as alternating short strokes to clearly mark it
+                        // as the "mathematical mirror" and not measured data.
+                        sf::Color dashedCol{T.accent.r, T.accent.g, T.accent.b, 160};
+                        const int DASH_STRIDE = 4;   // draw 4 pts, skip 4 pts
+                        for (size_t i = solidEnd; i + 1 < N; ++i) {
+                            // Skip every other DASH_STRIDE-segment to create dashes
+                            size_t seg = i - solidEnd;
+                            if ((seg / DASH_STRIDE) % 2 == 1) continue;
+                            float px0 = reToX(nyquist.re[i]);
+                            float py0 = imToY(nyquist.im[i]);
+                            float px1 = reToX(nyquist.re[i + 1]);
+                            float py1 = imToY(nyquist.im[i + 1]);
+                            sf::Vertex seg2[2] = {
+                                sf::Vertex{{px0, py0}, dashedCol},
+                                sf::Vertex{{px1, py1}, dashedCol}
+                            };
+                            window.draw(seg2, 2, sf::PrimitiveType::Lines);
+                        }
+
+                        window.setView(savedView);
+                    }
+
+                    // ── Critical point (−1, 0j) — red marker ──────────────────
+                    float cpx = reToX(-1.0);
+                    float cpy = imToY(0.0);
+                    if (cpx >= gx - 8.f && cpx <= gx + gw + 8.f &&
+                        cpy >= gy - 8.f && cpy <= gy + gh + 8.f) {
+                        sf::CircleShape cp(6.f);
+                        cp.setFillColor(sf::Color{220, 50, 50});
+                        cp.setOutlineColor(sf::Color{255, 255, 255, 180});
+                        cp.setOutlineThickness(1.5f);
+                        cp.setOrigin({6.f, 6.f});
+                        cp.setPosition({cpx, cpy});
+                        window.draw(cp);
+                        if (fontOk)
+                            drawText(window, font, "(-1,0)", cpx + 8.f, cpy - 14.f,
+                                     10, sf::Color{220, 50, 50});
+                    }
+
+                    // ── Origin dot ────────────────────────────────────────────
+                    float ox = reToX(0.0), oy = imToY(0.0);
+                    if (ox >= gx && ox <= gx + gw && oy >= gy && oy <= gy + gh) {
+                        sf::CircleShape ori(3.f);
+                        ori.setFillColor(T.text_lo);
+                        ori.setOrigin({3.f, 3.f});
+                        ori.setPosition({ox, oy});
+                        window.draw(ori);
+                    }
+
+                    // ── HUD labels (static, top of graph) ─────────────────────
+                    if (fontOk) {
+                        sf::Color hintCol = darkTheme ? sf::Color{70,70,70}
+                                                      : sf::Color{170,170,170};
+                        drawText(window, font,
+                                 nyqDragging ? "Dragging..." : "Drag to pan  |  Dbl-click: reset",
+                                 gx + gw - 4.f, gy + 4.f, 9, hintCol, false);
+                        if (std::abs(nyqPanX) > 0.001 || std::abs(nyqPanY) > 0.001) {
+                            std::ostringstream po;
+                            po << std::fixed << std::setprecision(3)
+                               << "pan Re=" << nyqPanX << "  Im=" << nyqPanY;
+                            drawText(window, font, po.str(), gx + 4.f, gy + 4.f, 9, hintCol);
+                        }
+                        // REQ 3: "Im" label placed INSIDE the subplot top-left corner
+                        // (not far-left outside the window). Self-contained engineering layout.
+                        drawText(window, font, "Im", gx + 10.f, gy + 10.f, 11, T.text_lo);
+                    }
+                } else if (fontOk) {
+                    drawText(window, font, "No valid transfer function - check input",
+                             gx + gw * 0.5f, gy + gh * 0.5f - 9.f, 13, T.text_lo, true);
+                }
+            } else if (g.isStep) {
+                if (step.valid && !step.time.empty()) {
+                    double tmax = step.time.back();
+                    sf::VertexArray va(sf::PrimitiveType::LineStrip, step.time.size());
+                    for (size_t i = 0; i < step.time.size(); ++i) {
+                        float px = gx + static_cast<float>(step.time[i]/tmax) * gw;
+                        double val = std::clamp(step.value[i], g.vmin, g.vmax);
+                        float  py  = valToY(val, g.vmin, g.vmax, gy, gh);
+                        va[i] = sf::Vertex{{px,py}, T.accent};
+                    }
+                    window.draw(va);
+                }
+            } else if (g.data && !g.data->empty()) {
+                sf::VertexArray va(sf::PrimitiveType::LineStrip, bode.freq.size());
+                for (size_t i = 0; i < bode.freq.size(); ++i) {
+                    float  px  = freqToX(bode.freq[i], gx, gw, logMaxFreq);
+                    // Use the raw data value — let valToY compute the pixel position,
+                    // then clamp the PIXEL so the line clips at the panel edges
+                    // (clamping the value itself shifts the curve and causes the offset bug)
+                    float  py  = valToY((*g.data)[i], g.vmin, g.vmax, gy, gh);
+                    py = std::clamp(py, gy, gy + gh);
+                    va[i] = sf::Vertex{{px, py}, T.accent};
+                }
+                window.draw(va);
+            } else if (!bode.valid && fontOk) {
+                drawText(window, font, "No valid transfer function - check input",
+                         gx+gw*0.5f, gy+gh*0.5f-9.f, 13, T.text_lo, true);
+            }
+        } // for each graph
+
+        // X-axis title
+        if (fontOk) {
+            std::string xTitle = showStep    ? "Time (s) -- Linear Scale"
+                               : showNyquist ? "Real Axis"
+                                             : "Frequency (Hz) -- Logarithmic Scale";
+            drawText(window, font, xTitle,
+                     GRAPH_X + GRAPH_W*0.5f, GPH_Y + GPH_H + 34.f,
+                     12, T.text_lo, true);
+        }
+
+        // Interactive Probe (Bode only)
+        bool overGraph =
+            mouse.x >= GRAPH_X && mouse.x <= GRAPH_X + GRAPH_W &&
+            ((mouse.y >= GMAG_Y && mouse.y <= GMAG_Y + GMAG_H) ||
+             (mouse.y >= GPH_Y  && mouse.y <= GPH_Y  + GPH_H));
+
+        if (overGraph && bode.valid && !bode.freq.empty() && !showStep && !showNyquist) {
+            double pf  = xToFreq(mouse.x, GRAPH_X, GRAPH_W, logMaxFreq);
+            size_t idx = 0;
+            double best = std::abs(std::log10(pf /( bode.freq[0])));
+            for (size_t i = 1; i < bode.freq.size(); ++i) {
+                double dd = std::abs(std::log10(pf / bode.freq[i]));
+                if (dd < best) { best = dd; idx = i; }
+            }
+            double af = bode.freq[idx] , am = bode.mag[idx], ap = bode.phase[idx];
+            float  ax = freqToX(af, GRAPH_X, GRAPH_W, logMaxFreq);
+
+            for (int gi = 0; gi < 2; ++gi) {
+                auto& g = graphs[gi];
+                if (g.isStep || g.isNyquist) continue;
+                drawRect(window, ax-0.5f, g.y, 1.f, g.h, {255,200,50,55});
+                drawLine(window, ax, g.y, ax, g.y+g.h, T.probe);
+                double val = gi==0 ? am : ap;
+                float  py  = valToY(val, g.vmin, g.vmax, g.y, g.h);
+                py = std::clamp(py, g.y, g.y + g.h);
+                sf::CircleShape dot(5.5f);
+                dot.setFillColor(T.accent);
+                dot.setOutlineColor(T.bg);
+                dot.setOutlineThickness(1.5f);
+                dot.setOrigin({5.5f, 5.5f});
+                dot.setPosition({ax, py});
+                window.draw(dot);
+            }
+
+            if (fontOk) {
+                std::string fl = freqLabel(af*10.0);
+                std::string ml, pl;
+                { std::ostringstream o; o<<std::fixed<<std::setprecision(2)<<am<<" dB";  ml=o.str(); }
+                { std::ostringstream o; o<<std::fixed<<std::setprecision(2)<<ap<<" deg"; pl=o.str(); }
+
+                float ttx = ax + 14.f;
+                if (ttx + 190.f > GRAPH_X + GRAPH_W) ttx = ax - 204.f;
+                float tty = GMAG_Y + 12.f;
+                sf::Color ttBorder = darkTheme ? sf::Color{70,70,70} : sf::Color{150,158,170};
+                sf::Color phColor  = darkTheme ? sf::Color{130,180,255} : sf::Color{30,80,200};
+                drawRect(window, ttx-10.f, tty-10.f, 192.f, 90.f, T.tt_bg, ttBorder, 1.f);
+                drawText(window, font, "f :   " + fl, ttx, tty,      13, T.text_hi);
+                drawText(window, font, "Mag: " + ml,  ttx, tty+24.f, 13, T.accent);
+                drawText(window, font, "Ph:  " + pl,  ttx, tty+48.f, 13, phColor);
+            }
+        }
+
+        // Status bar
+        sf::Color statusBg  = darkTheme ? sf::Color{14,14,14}  : sf::Color{230,232,238};
+        sf::Color statusSep = darkTheme ? sf::Color{45,45,45}  : sf::Color{175,182,195};
+        sf::Color statusTxt = darkTheme ? sf::Color{100,100,100}: sf::Color{80,88,100};
+        drawRect(window, 0.f, WIN_H-24.f, WIN_W, 24.f, statusBg);
+        drawLine(window, 0.f, WIN_H-24.f, WIN_W, WIN_H-24.f, statusSep);
+        if (fontOk)
+            drawText(window, font, statusMsg, PANEL_W+12.f, WIN_H-19.f, 11, statusTxt);
+
+        } // AppState::DASHBOARD
+
+        // ── Welcome screen overlay (drawn last so it sits on top) ─────────────
+        if (appState == AppState::WELCOME) {
+            welcome.draw(window, font, fontOk, WIN_W, WIN_H);
+        }
+
+        window.display();
+    }
+    return 0;
+}
